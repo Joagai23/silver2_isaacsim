@@ -25,7 +25,7 @@ class OmnidirectionalGaitController(Node):
     def __init__(self):
         super().__init__('omnidirectional_gait_controller')
 
-        # Fixed gait parameters
+        # Fixed gait parameters (Gazebo ones)
         self.gait_width = 40.0
         self.gait_height = 30.0
         self.step_length = 20.0
@@ -43,31 +43,40 @@ class OmnidirectionalGaitController(Node):
 
         # Robot model and communication setup
         self.robot = robot.Robot()
-        self.Q_current = robot.static_poses_pos['dragon']
+        self.Q_current = robot.static_poses_pos['zero']
 
         self.joint_order = [
-            'coxa_joint_0', 'coxa_joint_1', 'coxa_joint_2','coxa_joint_3', 'coxa_joint_4', 'coxa_joint_5',
-            'femur_joint_0', 'femur_joint_1', 'femur_joint_2','femur_joint_3', 'femur_joint_4', 'femur_joint_5',
-            'tibia_joint_0', 'tibia_joint_1', 'tibia_joint_2',' tibia_joint_3', 'tibia_joint_4', 'tibia_joint_5'
+            'coxa_joint_0', 'femur_joint_0', 'tibia_joint_0',
+            'coxa_joint_1', 'femur_joint_1', 'tibia_joint_1',
+            'coxa_joint_2', 'femur_joint_2', 'tibia_joint_2',
+            'coxa_joint_3', 'femur_joint_3', 'tibia_joint_3',
+            'coxa_joint_4', 'femur_joint_4', 'tibia_joint_4',
+            'coxa_joint_5', 'femur_joint_5', 'tibia_joint_5',
         ]
 
         self.joint_state_subscriber = self.create_subscription(JointState, '/joint_states', self.joint_state_subscriber_callback, 10)
         self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
         self.pid_pos_publisher = self.create_publisher(JointState, '/joint_command', 10)
-        self.timestep = 0.1
+        self.timestep = 0.06        
 
     def joint_state_subscriber_callback(self, msg):
-        joint_position_dict = dict(zip(msg.name, msg.position))
+        # Convert from isaac format
+        isaac_pos = [a*b for a,b in zip(robot.static_poses_pos['from_isaac'], msg.position)]
+        joint_position_dict = dict(zip(msg.name, isaac_pos))
+        # Save current joint state
         for i, joint_name in enumerate(self.joint_order):
             if joint_name in joint_position_dict:
                 self.Q_current[i] = joint_position_dict[joint_name]
             else:
                 self.get_logger().warn(f"Joint {joint_name} not found in message")
+        self.get_logger().warn(f"Current Q: {self.Q_current}")
 
     def cmd_vel_callback(self, msg):
         self.latest_cmd = msg
 
     def change_configuration_loop(self, Q_target):
+        
+        self.get_logger().warn(f"Target Q: {Q_target}")
         Q_cc, _, Admiss_cc, nstep_cc, ctrl_timestep = self.robot.change_configuration(Q_target, self.Q_current)
         if not all(Admiss_cc):
             self.get_logger().warn("Configuration change outside workspace")
@@ -157,17 +166,20 @@ class OmnidirectionalGaitController(Node):
                 f"The number of joint names ({len(self.joint_order)}) does not match "
                 f"the number of received positions ({len(pos_array)})."
             )
-        
+            
         # Create and populate Joint State
         joint_state_msg = JointState()
         joint_state_msg.name = self.joint_order
-        joint_state_msg.position = pos_array
+        # Convert to isaac format
+        isaac_pos = [a*b for a,b in zip(robot.static_poses_pos['to_isaac'], pos_array)]
+        joint_state_msg.position = isaac_pos
         joint_state_msg.velocity = []
         joint_state_msg.effort = []
 
         # Publish and Wait
         self.pid_pos_publisher.publish(joint_state_msg)
-        time.sleep(self.timestep)
+        #self.get_logger().warn(f"Timestep: {timestep}")
+        time.sleep(timestep)
 
 if __name__ == '__main__':
     rclpy.init()

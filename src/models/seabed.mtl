@@ -1,0 +1,13 @@
+# Blender 4.4.3 MTL File: 'Terrain.blend'
+# www.blender.org
+
+newmtl Material.001
+Ns 10.000005
+Ka 1.000000 1.000000 1.000000
+Kd 0.700000 0.700000 0.500000
+Ks 0.500000 0.500000 0.500000
+Ke 0.000000 0.000000 0.000000
+Ni 1.500000
+d 1.000000
+illum 2
+map_Bump -bm 1.000000 C:/Users/Jacopo_Admin/Downloads/sand_normal.png

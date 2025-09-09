@@ -56,8 +56,7 @@ class OmnidirectionalGaitController(Node):
 
         self.joint_state_subscriber = self.create_subscription(JointState, '/joint_states', self.joint_state_subscriber_callback, 10)
         self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
-        self.pid_pos_publisher = self.create_publisher(JointState, '/joint_command', 10)
-        self.timestep = 0.06        
+        self.pid_pos_publisher = self.create_publisher(JointState, '/joint_command', 10)     
 
     def joint_state_subscriber_callback(self, msg):
         # Convert from isaac format
@@ -69,14 +68,11 @@ class OmnidirectionalGaitController(Node):
                 self.Q_current[i] = joint_position_dict[joint_name]
             else:
                 self.get_logger().warn(f"Joint {joint_name} not found in message")
-        self.get_logger().warn(f"Current Q: {self.Q_current}")
 
     def cmd_vel_callback(self, msg):
         self.latest_cmd = msg
 
     def change_configuration_loop(self, Q_target):
-        
-        self.get_logger().warn(f"Target Q: {Q_target}")
         Q_cc, _, Admiss_cc, nstep_cc, ctrl_timestep = self.robot.change_configuration(Q_target, self.Q_current)
         if not all(Admiss_cc):
             self.get_logger().warn("Configuration change outside workspace")
@@ -178,7 +174,6 @@ class OmnidirectionalGaitController(Node):
 
         # Publish and Wait
         self.pid_pos_publisher.publish(joint_state_msg)
-        #self.get_logger().warn(f"Timestep: {timestep}")
         time.sleep(timestep)
 
 if __name__ == '__main__':

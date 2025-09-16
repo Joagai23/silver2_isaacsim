@@ -46,16 +46,16 @@ class BuoyancyComponent(BehaviorScript):
             "doc": "Total height of the object in m.",
         },
         {
-            "attr_name": "linearDamping",
+            "attr_name": "maxLinearDamping",
             "attr_type": Sdf.ValueTypeNames.Float,
-            "default_value": 1.0,
-            "doc": "Damping factor to resist linear motion.",
+            "default_value": 100.0,
+            "doc": "Max damping when fully submerged.",
         },
         {
-            "attr_name": "angularDamping",
+            "attr_name": "maxAngularDamping",
             "attr_type": Sdf.ValueTypeNames.Float,
-            "default_value": 0.5,
-            "doc": "Damping factor to resist rotational motion.",
+            "default_value": 50.0,
+            "doc": "Max angular damping when fully submerged.",
         },
     ]
 
@@ -104,25 +104,32 @@ class BuoyancyComponent(BehaviorScript):
         
         # Get prim paths and APIs
         self._rigid_prim = RigidPrim(str(self.prim_path))
-        stage = omni.usd.get_context().get_stage()
+        """stage = omni.usd.get_context().get_stage()
         prim = stage.GetPrimAtPath(str(self.prim_path))
-        physx_api = PhysxSchema.PhysxRigidBodyAPI(prim)
+        physx_api = PhysxSchema.PhysxRigidBodyAPI(prim)"""
 
         # Fetch the exposed attributes
         water_density = self._get_exposed_variable("waterDensity")
         gravity = self._get_exposed_variable("gravity")
         volume = self._get_exposed_variable("volume")
         height = self._get_exposed_variable("height")
-        linear_damping = self._get_exposed_variable("linearDamping")
-        angular_damping = self._get_exposed_variable("angularDamping")
+        max_linear_damping = self._get_exposed_variable("maxLinearDamping")
+        max_angular_damping = self._get_exposed_variable("maxAngularDamping")
 
         # Set prim physix attributes
-        angular_damping_attr = physx_api.GetAngularDampingAttr()
+        """angular_damping_attr = physx_api.GetAngularDampingAttr()
         angular_damping_attr.Set(angular_damping)
         linear_damping_attr = physx_api.GetLinearDampingAttr()
-        linear_damping_attr.Set(linear_damping)
+        linear_damping_attr.Set(linear_damping)"""
 
-        self._hydro_calculator = Hydrodynamics(total_volume=volume, total_height=height, water_density=water_density, gravity=gravity)
+        self._hydro_calculator = Hydrodynamics(
+            total_volume=volume, 
+            total_height=height,
+            max_linear_damping=max_linear_damping,
+            max_angular_damping=max_angular_damping,
+            water_density=water_density, 
+            gravity=gravity
+        )
         carb.log_info(f"BuoyancyComponent initialized for {self.prim_path}")
 
     def _reset(self):
@@ -137,12 +144,27 @@ class BuoyancyComponent(BehaviorScript):
         # The result is an array, so we must index it to get the first (and only) element
         position = positions[0]
         orientation_quat = orientations[0]
+        # Fetch linear and angular velocities
+        linear_velocity = self._rigid_prim.get_linear_velocities()
+        angular_velocity = self._rigid_prim.get_angular_velocities()
 
         # Reorder quat for our function and calculate force
         quat_xyzw = np.array([orientation_quat[1], orientation_quat[2], orientation_quat[3], orientation_quat[0]])
-        force_vector = self._hydro_calculator.calculate_buoyancy(position, quat_xyzw)
+        
+        # Get hydrodynamic forces and torques
+        total_force, total_torque = self._hydro_calculator.calculate_hydrodynamic_forces(
+            position=position,
+            orientation_quat=quat_xyzw,
+            linear_vel=linear_velocity,
+            angular_vel=angular_velocity
+        )
+        
         # Apply the calculated force
-        self._rigid_prim.apply_forces(force_vector, is_global=True)
+        self._rigid_prim.apply_forces_and_torques_at_pos(
+            forces=np.expand_dims(total_force, axis=0),
+            torques=np.expand_dims(total_torque, axis=0),
+            is_global=True
+        )
 
     def _reset(self):
         """Clears cached objects."""

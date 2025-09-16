@@ -5,39 +5,76 @@ class Hydrodynamics:
     """
     A class to calculate hydrodynamic forces for an object (Buoyancy and Drag).
     """
-    def __init__(self, total_volume, total_height, water_density=1000.0, gravity=9.81):
+    def __init__(self, total_volume, total_height, max_linear_damping, max_angular_damping, water_density=1000.0, gravity=9.81):
         self.total_volume = total_volume
         self.total_height = total_height
         self.water_density = water_density
         self.gravity = gravity
+        self.max_linear_damping = max_linear_damping
+        self.max_angular_damping = max_angular_damping
         # Works for now as the cube is orthogonal --> must be changed later on
         s = total_height / 2.0
         self._local_corners = np.array([
             [s, s, s], [-s, s, s], [s, -s, s], [-s, -s, s],
             [s, s, -s], [-s, s, -s], [s, -s, -s], [-s, -s, -s]
         ])
+
+    def calculate_hydrodynamic_forces(self, position, orientation_quat, linear_vel, angular_vel):
+        """
+        Calculates and returns all hydrodynamic forces and torques acting on the object.
+        """
+        roll, pitch, yaw = self._quaternion_to_euler(orientation_quat)
+        rotation_matrix = self._get_rotation_matrix(roll, pitch, yaw)
+        world_corners = self._get_world_corners(position, rotation_matrix)
+        submerged_count = np.sum(world_corners[:, 2] < 0)
+        submersion_ratio = submerged_count / 8.0
+
+        buoyancy_force = self._calculate_buoyancy(submersion_ratio)
+        drag_force, drag_torque = self._calculate_drag(submersion_ratio, linear_vel, angular_vel)
+        total_force = buoyancy_force + drag_force
+        
+        return total_force, drag_torque
     
-    def calculate_buoyancy(self, position, quaternion):
+    def _calculate_buoyancy(self, submersion_ratio):
         """
             Calculates the buoyancy force vector based on submergence and orientation.
 
             Args:
-                position (float[3]): Position coordinates of the center of the object in the world.
-                quaternion (float[4]): The object's orientation as a quaternion [x, y, z, w].
+                submersion_ratio (float): Approximate value of the object that is underwater (Z < 0.0).
 
             Returns:
                 np.array: A 3D vector representing the buoyancy force in the world coordinate frame.
         """
-        roll, pitch, yaw = self._quaternion_to_euler(quaternion)
-        rotation_matrix = self._get_rotation_matrix(roll, pitch, yaw)
-        world_corners = self._get_world_corners(position, rotation_matrix)
-        submerged_count = np.sum(world_corners[:, 2] < 0)
-        submerged_ratio = submerged_count / 8.0
-        submerged_volume = submerged_ratio * self.total_volume
+        submerged_volume = submersion_ratio * self.total_volume
         buoyancy_magnitude = self.water_density * submerged_volume * self.gravity   
         buoyancy_vector = np.array([0.0, 0.0, buoyancy_magnitude])
 
         return buoyancy_vector
+    
+    def _calculate_drag(self, submersion_ratio, linear_velocity, angular_velocity):
+        """
+        Calculates drag force and torque based on submersion level.
+
+            Args:
+                submersion_ratio (float): Approximate value of the object that is underwater (Z < 0.0).
+                linear_velocity (float[3]): Current rate of change of an object's displacement along a straight line.
+                angular_velocity (float[3]): Current rate of change of an object's angular displacement over time.
+
+            Returns:
+                drag_force (np.array): A 3D vector representing the resistance force against the object's translational motion.
+                drag_torque (np.array): A 3D vector representing the resistance force against the object's rotational motion.
+        """
+        current_linear_damping = self.max_linear_damping * submersion_ratio
+        current_angular_damping = self.max_angular_damping * submersion_ratio
+        
+        # Add a small constant damping for when the object is in the air
+        current_linear_damping += 0.01
+        current_angular_damping += 0.01
+
+        drag_force = -current_linear_damping * linear_velocity
+        drag_torque = -current_angular_damping * angular_velocity
+
+        return drag_force, drag_torque
 
     def _quaternion_to_euler(self, quaternion):
         """

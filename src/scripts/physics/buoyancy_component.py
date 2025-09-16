@@ -140,7 +140,7 @@ class BuoyancyComponent(BehaviorScript):
 
         # Reorder quat for our function and calculate force
         quat_xyzw = np.array([orientation_quat[1], orientation_quat[2], orientation_quat[3], orientation_quat[0]])
-        force_vector = self._hydro_calculator.calculate_buoyancy(position[2], quat_xyzw)
+        force_vector = self._hydro_calculator.calculate_buoyancy(position, quat_xyzw)
         # Apply the calculated force
         self._rigid_prim.apply_forces(force_vector, is_global=True)
 

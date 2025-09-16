@@ -10,52 +10,34 @@ class Hydrodynamics:
         self.total_height = total_height
         self.water_density = water_density
         self.gravity = gravity
-
-    def calculate_buoyancy(self, z_position, quaternion):
+        # Works for now as the cube is orthogonal --> must be changed later on
+        s = total_height / 2.0
+        self._local_corners = np.array([
+            [s, s, s], [-s, s, s], [s, -s, s], [-s, -s, s],
+            [s, s, -s], [-s, s, -s], [s, -s, -s], [-s, -s, -s]
+        ])
+    
+    def calculate_buoyancy(self, position, quaternion):
         """
             Calculates the buoyancy force vector based on submergence and orientation.
 
             Args:
-                z_position (float): The vertical position (Z-axis) of the object's center in the world.
+                position (float[3]): Position coordinates of the center of the object in the world.
                 quaternion (float[4]): The object's orientation as a quaternion [x, y, z, w].
 
             Returns:
                 np.array: A 3D vector representing the buoyancy force in the world coordinate frame.
         """
         roll, pitch, yaw = self._quaternion_to_euler(quaternion)
-        submerged_ratio = self._calculate_submerged_ratio(z_position)
-        submerged_volume = submerged_ratio * self.total_volume
-        buoyancy_magnitude = self.water_density * submerged_volume * self.gravity
         rotation_matrix = self._get_rotation_matrix(roll, pitch, yaw)
+        world_corners = self._get_world_corners(position, rotation_matrix)
+        submerged_count = np.sum(world_corners[:, 2] < 0)
+        submerged_ratio = submerged_count / 8.0
+        submerged_volume = submerged_ratio * self.total_volume
+        buoyancy_magnitude = self.water_density * submerged_volume * self.gravity   
         buoyancy_vector = np.array([0.0, 0.0, buoyancy_magnitude])
-        rotation_force_vector = rotation_matrix @ buoyancy_vector
 
-        return rotation_force_vector
-    
-    def _calculate_submerged_ratio(self, z_position):
-        """
-        Calculates the submerged ratio of an object by its height.
-        This method is accurate for objects with a uniform cross-sectional area.
-        This method assumes the fluid surface is at z = 0.
-        
-        Args:
-            total_height (float): The total vertical height of the object.
-            z_position (float): The Z-coordinate of the center of the object.
-
-        Returns:
-            float: The submerged ratio (a value between 0.0 and 1.0).
-        """
-        if self.total_height <= 0:
-            print("Error: Total height must be a positive number.")
-            return 0
-        
-        half_height = self.total_height / 2.0
-        bottom_z_position = z_position - half_height
-
-        submerged_height = min(self.total_height, max(0, -bottom_z_position))
-        submerged_ratio = submerged_height / self.total_height
-
-        return submerged_ratio
+        return buoyancy_vector
 
     def _quaternion_to_euler(self, quaternion):
         """
@@ -70,18 +52,18 @@ class Hydrodynamics:
         """
         x, y, z, w = quaternion
         # Roll
-        sinr_cosp = 2.0 * (w * x + y * z)
-        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
-        roll_x = np.arctan2(sinr_cosp, cosr_cosp)
+        t0 = 2.0 * (w * x + y * z)
+        t1 = 1.0 - 2.0 * (x * x + y * y)
+        roll_x = np.arctan2(t0, t1)
         # Pitch
-        sinp = np.sqrt(1.0 + 2.0 * (w * y - x * z))
-        cosp = np.sqrt(1.0 - 2.0 * (w * y - x * z))
-        pitch_y = 2.0 * np.arctan2(sinp, cosp) - (math.pi / 2.0)
+        t2 = 2.0 * (w * y - z * x)
+        t2 = np.clip(t2, -1.0, 1.0) 
+        pitch_y = np.arcsin(t2)
         # Yaw
-        siny_cosp = 2.0 * (w * z + x * y)
-        cosy_cosp = 1 - 2.0 * (y * y + z * z)
-        yaw_z = np.arctan2(siny_cosp, cosy_cosp)
-
+        t3 = 2.0 * (w * z + x * y)
+        t4 = 1.0 - 2.0 * (y * y + z * z)
+        yaw_z = np.arctan2(t3, t4)
+        
         return roll_x, pitch_y, yaw_z
     
     def _get_rotation_matrix(self, roll, pitch, yaw):
@@ -105,3 +87,23 @@ class Hydrodynamics:
             [s_y*c_p,   s_y*s_p*s_r + c_y*c_r,  s_y*s_p*c_r - c_y*s_r],
             [-s_p,      c_p*s_r,                c_p*c_r]
         ])
+    
+    def _get_world_corners(self, position, rotation_matrix):
+        """
+        Calculates the world coordinates of the 8 corners of the cube.
+
+        Args:
+            position (float[3]): Position coordinates of the center of the object in the world.
+            rotation_matrix (np.array): A 3x3 matrix representing the rotation of the object in the world coordinate frame.
+        
+        Returns:
+            np.array: An (8, 3) numpy array of the corner positions in world space, or None.
+        """
+        transform_matrix = np.eye(4)
+        transform_matrix[:3, :3] = rotation_matrix
+        transform_matrix[:3, 3] = position
+
+        local_corners_homogeneous = np.hstack([self._local_corners, np.ones((8, 1))])
+        world_corners_homogeneous = (transform_matrix @ local_corners_homogeneous.T).T
+
+        return world_corners_homogeneous[:, :3]

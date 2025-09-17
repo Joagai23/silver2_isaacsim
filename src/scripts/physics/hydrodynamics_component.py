@@ -10,15 +10,14 @@ from isaacsim.replicator.behavior.utils.behavior_utils import (
 )
 from omni.kit.scripting import BehaviorScript
 from pxr import Sdf, UsdPhysics
-from pxr import PhysxSchema
 from isaacsim.core.prims import RigidPrim
-from .hidrodynamics import Hydrodynamics
+from .hydrodynamics import Hydrodynamics
 
-class BuoyancyComponent(BehaviorScript):
+class HydrodynamicsComponent(BehaviorScript):
     """
-    Behavior script that applies buoyancy and damping forces to a rigid body.
+    Behavior script that applies buoyancy and drag forces to a rigid body.
     """
-    BEHAVIOR_NS = "buoyancyBehavior"
+    BEHAVIOR_NS = "hydrodynamicsBehavior"
 
     VARIABLES_TO_EXPOSE = [
         {
@@ -34,16 +33,22 @@ class BuoyancyComponent(BehaviorScript):
             "doc": "Gravitational acceleration in m/s^2.",
         },
         {
-            "attr_name": "volume",
+            "attr_name": "width",
             "attr_type": Sdf.ValueTypeNames.Float,
             "default_value": 1.0,
-            "doc": "Volume of the object in m^3.",
+            "doc": "Lenght of the object in the X-axis in m.",
+        },
+        {
+            "attr_name": "depth",
+            "attr_type": Sdf.ValueTypeNames.Float,
+            "default_value": 1.0,
+            "doc": "Lenght of the object in the Y-axis in m.",
         },
         {
             "attr_name": "height",
             "attr_type": Sdf.ValueTypeNames.Float,
             "default_value": 1.0,
-            "doc": "Total height of the object in m.",
+            "doc": "Lenght of the object in the Z-axis in m.",
         },
         {
             "attr_name": "maxLinearDamping",
@@ -95,47 +100,43 @@ class BuoyancyComponent(BehaviorScript):
 
         self._apply_behavior()
 
+    def _reset(self):
+        self._hydro_calculator = None
+        self._rigid_prim = None
+
+    def _get_exposed_variable(self, attr_name):
+        full_attr_name = f"{EXPOSED_ATTR_NS}:{self.BEHAVIOR_NS}:{attr_name}"
+        return get_exposed_variable(self.prim, full_attr_name)
+    
     def _setup(self):
         """Initialize physics objects and read UI values"""
          # Check if the prim has physics enabled
         if not self.prim.HasAPI(UsdPhysics.CollisionAPI):
-            carb.log_warn(f"BuoyancyComponent on prim {self.prim_path} requires a Rigid Body component.")
+            carb.log_warn(f"HydrodynamicsComponent on prim {self.prim_path} requires a Collider (and RigidBody) component.")
             return
         
-        # Get prim paths and APIs
+        # Get prim path
         self._rigid_prim = RigidPrim(str(self.prim_path))
-        """stage = omni.usd.get_context().get_stage()
-        prim = stage.GetPrimAtPath(str(self.prim_path))
-        physx_api = PhysxSchema.PhysxRigidBodyAPI(prim)"""
 
         # Fetch the exposed attributes
         water_density = self._get_exposed_variable("waterDensity")
         gravity = self._get_exposed_variable("gravity")
-        volume = self._get_exposed_variable("volume")
+        width = self._get_exposed_variable("width")
+        depth = self._get_exposed_variable("depth")
         height = self._get_exposed_variable("height")
         max_linear_damping = self._get_exposed_variable("maxLinearDamping")
         max_angular_damping = self._get_exposed_variable("maxAngularDamping")
 
-        # Set prim physix attributes
-        """angular_damping_attr = physx_api.GetAngularDampingAttr()
-        angular_damping_attr.Set(angular_damping)
-        linear_damping_attr = physx_api.GetLinearDampingAttr()
-        linear_damping_attr.Set(linear_damping)"""
-
         self._hydro_calculator = Hydrodynamics(
-            total_volume=volume, 
-            total_height=height,
+            width=width,
+            depth=depth,
+            height=height,
             max_linear_damping=max_linear_damping,
             max_angular_damping=max_angular_damping,
             water_density=water_density, 
             gravity=gravity
         )
-        carb.log_info(f"BuoyancyComponent initialized for {self.prim_path}")
-
-    def _reset(self):
-        self._hydro_calculator = None
-        self._rigid_prim = None
-        self._view = None
+        carb.log_info(f"HydrodynamicsComponent initialized for {self.prim_path}")
 
     def _apply_behavior(self):
         """Calculates and applies the buoyancy force."""
@@ -165,12 +166,3 @@ class BuoyancyComponent(BehaviorScript):
             torques=np.expand_dims(total_torque, axis=0),
             is_global=True
         )
-
-    def _reset(self):
-        """Clears cached objects."""
-        self._hydro_calculator = None
-        self._rigid_prim = None
-
-    def _get_exposed_variable(self, attr_name):
-        full_attr_name = f"{EXPOSED_ATTR_NS}:{self.BEHAVIOR_NS}:{attr_name}"
-        return get_exposed_variable(self.prim, full_attr_name)

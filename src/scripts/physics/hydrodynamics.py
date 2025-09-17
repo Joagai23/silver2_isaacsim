@@ -5,19 +5,16 @@ class Hydrodynamics:
     """
     A class to calculate hydrodynamic forces for an object (Buoyancy and Drag).
     """
-    def __init__(self, total_volume, total_height, max_linear_damping, max_angular_damping, water_density=1000.0, gravity=9.81):
-        self.total_volume = total_volume
-        self.total_height = total_height
+    def __init__(self, width, depth, height, max_linear_damping, max_angular_damping, water_density=1000.0, gravity=9.81):
+        self.width = width
+        self.depth = depth
+        self.height = height
         self.water_density = water_density
         self.gravity = gravity
         self.max_linear_damping = max_linear_damping
         self.max_angular_damping = max_angular_damping
-        # Works for now as the cube is orthogonal --> must be changed later on
-        s = total_height / 2.0
-        self._local_corners = np.array([
-            [s, s, s], [-s, s, s], [s, -s, s], [-s, -s, s],
-            [s, s, -s], [-s, s, -s], [s, -s, -s], [-s, -s, -s]
-        ])
+        self.total_volume = width * depth * height
+        self._local_keypoints = self._create_cube_keypoints()
 
     def calculate_hydrodynamic_forces(self, position, orientation_quat, linear_vel, angular_vel):
         """
@@ -27,7 +24,7 @@ class Hydrodynamics:
         rotation_matrix = self._get_rotation_matrix(roll, pitch, yaw)
         world_corners = self._get_world_corners(position, rotation_matrix)
         submerged_count = np.sum(world_corners[:, 2] < 0)
-        submersion_ratio = submerged_count / 8.0
+        submersion_ratio = submerged_count / 27
 
         buoyancy_force = self._calculate_buoyancy(submersion_ratio)
         drag_force, drag_torque = self._calculate_drag(submersion_ratio, linear_vel, angular_vel)
@@ -127,20 +124,45 @@ class Hydrodynamics:
     
     def _get_world_corners(self, position, rotation_matrix):
         """
-        Calculates the world coordinates of the 8 corners of the cube.
+        Calculates the world coordinates of the 27 keypoints of the cube.
 
         Args:
             position (float[3]): Position coordinates of the center of the object in the world.
             rotation_matrix (np.array): A 3x3 matrix representing the rotation of the object in the world coordinate frame.
         
         Returns:
-            np.array: An (8, 3) numpy array of the corner positions in world space, or None.
+            np.array: An (27, 3) numpy array of the key positions in world space, or None.
         """
         transform_matrix = np.eye(4)
         transform_matrix[:3, :3] = rotation_matrix
         transform_matrix[:3, 3] = position
 
-        local_corners_homogeneous = np.hstack([self._local_corners, np.ones((8, 1))])
+        local_corners_homogeneous = np.hstack([self._local_keypoints, np.ones((27, 1))])
         world_corners_homogeneous = (transform_matrix @ local_corners_homogeneous.T).T
 
         return world_corners_homogeneous[:, :3]
+    
+    def _create_cube_keypoints(self):
+        """
+        Generates a 27x3 matrix containing key position vertices for volume calculations.
+        """
+        x = self.width / 2.0
+        y = self.depth / 2.0
+        z = self.height / 2.0
+
+        return np.array([
+            # Top Layer
+            [-x, +y, +z], [0, +y, +z], [+x, +y, +z],
+            [-x, 0, +z], [0, 0, +z], [+x, 0, +z],
+            [-x, -y, +z], [0, -y, +z], [+x, -y, +z],
+
+            # Middle Layer
+            [-x, +y, 0], [0, +y, 0], [+x, +y, 0],
+            [-x, 0, 0], [0, 0, 0], [+x, 0, 0],
+            [-x, -y, 0], [0, -y, 0], [+x, -y, 0],
+
+            # Bottom Layer
+            [-x, +y, -z], [0, +y, -z], [+x, +y, -z],
+            [-x, 0, -z], [0, 0, -z], [+x, 0, -z],
+            [-x, -y, -z], [0, -y, -z], [+x, -y, -z]
+        ])

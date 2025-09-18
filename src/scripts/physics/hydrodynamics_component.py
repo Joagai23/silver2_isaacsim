@@ -53,13 +53,13 @@ class HydrodynamicsComponent(BehaviorScript):
         {
             "attr_name": "maxLinearDamping",
             "attr_type": Sdf.ValueTypeNames.Float,
-            "default_value": 100.0,
+            "default_value": 250.0,
             "doc": "Max damping when fully submerged.",
         },
         {
             "attr_name": "maxAngularDamping",
             "attr_type": Sdf.ValueTypeNames.Float,
-            "default_value": 50.0,
+            "default_value": 100.0,
             "doc": "Max angular damping when fully submerged.",
         },
     ]

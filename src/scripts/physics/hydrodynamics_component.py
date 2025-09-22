@@ -12,6 +12,12 @@ from omni.kit.scripting import BehaviorScript
 from pxr import Sdf, UsdPhysics
 from isaacsim.core.prims import RigidPrim
 from .hydrodynamics import Hydrodynamics
+"""
+# Log Drag
+import csv
+import datetime
+import os
+"""
 
 class HydrodynamicsComponent(BehaviorScript):
     """
@@ -65,6 +71,12 @@ class HydrodynamicsComponent(BehaviorScript):
     ]
 
     def on_init(self):
+        """
+        # Log Drag
+        script_directory = os.path.dirname(__file__)
+        self._log_file_path = os.path.join(script_directory, "drag_log.csv")
+        """
+
         """Called when the script is assigned to a prim."""
         self._hydro_calculator = None
         self._rigid_prim = None
@@ -109,10 +121,23 @@ class HydrodynamicsComponent(BehaviorScript):
         return get_exposed_variable(self.prim, full_attr_name)
     
     def _setup(self):
+        """
+        # Log Drag
+        header = ['timestamp', 'linear_drag_x', 'linear_drag_y', 'linear_drag_z',
+                  'angular_drag_x', 'angular_drag_y', 'angular_drag_z']
+        try:
+            with open(self._log_file_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+            carb.log_info(f"Log file created at {self._log_file_path}")
+        except Exception as e:
+            carb.log_error(f"Failed to create log file: {e}")
+        """
+
         """Initialize physics objects and read UI values"""
-         # Check if the prim has physics enabled
-        if not self.prim.HasAPI(UsdPhysics.CollisionAPI):
-            carb.log_warn(f"HydrodynamicsComponent on prim {self.prim_path} requires a Collider (and RigidBody) component.")
+        # Check if the prim has physics enabled
+        if not self.prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            carb.log_warn(f"HydrodynamicsComponent on prim {self.prim_path} requires a RigidBody component.")
             return
         
         # Get prim path
@@ -159,6 +184,25 @@ class HydrodynamicsComponent(BehaviorScript):
             linear_vel=linear_velocity,
             angular_vel=angular_velocity
         )
+
+        """
+        # Log Drag
+        log_row = [
+            datetime.datetime.now().isoformat(),
+            drag_force[0][0],
+            drag_force[0][1],
+            drag_force[0][2],
+            total_torque[0][0],
+            total_torque[0][1],
+            total_torque[0][2],
+        ]
+        try:
+            with open(self._log_file_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(log_row)
+        except Exception as e:
+            carb.log_warn(f"Failed to write to log file: {e}")
+        """
         
         # Apply the calculated force
         self._rigid_prim.apply_forces_and_torques_at_pos(

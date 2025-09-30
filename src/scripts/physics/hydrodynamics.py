@@ -5,15 +5,16 @@ class Hydrodynamics:
     """
     A class to calculate hydrodynamic forces for an object (Buoyancy and Drag).
     """
-    def __init__(self, width, depth, height, max_linear_damping, max_angular_damping, water_density=1000.0, gravity=9.81):
+    def __init__(self, width, depth, height, drag_coefficient, angular_drag_coefficient, water_density, gravity):
         self.width = width
         self.depth = depth
         self.height = height
         self.water_density = water_density
         self.gravity = gravity
-        self.max_linear_damping = max_linear_damping
-        self.max_angular_damping = max_angular_damping
+        self.drag_coefficient = drag_coefficient
+        self.angular_drag_coefficient = angular_drag_coefficient
         self.total_volume = width * depth * height
+        self._face_areas, self._local_face_normals = self._create_cube_facepoints()
         self._local_keypoints = self._create_cube_keypoints()
 
     def calculate_hydrodynamic_forces(self, position, orientation_quat, linear_vel, angular_vel):
@@ -27,7 +28,7 @@ class Hydrodynamics:
         submersion_ratio = submerged_count / 27
 
         buoyancy_force = self._calculate_buoyancy(submersion_ratio)
-        drag_force, drag_torque = self._calculate_drag(submersion_ratio, linear_vel, angular_vel)
+        drag_force, drag_torque = self._calculate_quadratic_drag(submersion_ratio, linear_vel, angular_vel, rotation_matrix)
         total_force = buoyancy_force + drag_force
         
         return total_force, drag_torque
@@ -48,7 +49,7 @@ class Hydrodynamics:
 
         return buoyancy_vector
     
-    def _calculate_drag(self, submersion_ratio, linear_velocity, angular_velocity):
+    def _calculate_linear_drag(self, submersion_ratio, linear_velocity, angular_velocity):
         """
         Calculates drag force and torque based on submersion level.
 
@@ -72,6 +73,54 @@ class Hydrodynamics:
         drag_torque = -current_angular_damping * angular_velocity
 
         return drag_force, drag_torque
+    
+    def _calculate_quadratic_drag(self, submersion_ratio, linear_velocity, angular_velocity, rotation_matrix):
+        """
+        Calculates drag force and torque using the quadratic drag formula.
+        Fd = 0.5 * rho * u^2 * Cd * A
+        """
+        # Linear Drag
+        speed = np.linalg.norm(linear_velocity)
+        
+        if speed < 1e-6:
+            drag_force = np.zeros(3)
+        else:
+            velocity_direction = linear_velocity / speed
+            dynamic_area = self._get_dynamic_cross_sectional_area(rotation_matrix, velocity_direction)
+
+            drag_magnitude = 0.5 * self.water_density * (speed ** 2) * self.drag_coefficient * dynamic_area
+            drag_force = -drag_magnitude * velocity_direction
+            drag_force *= submersion_ratio
+
+        # Angular Drag (simplified quadratic model)
+        angular_speed = np.linalg.norm(angular_velocity)
+
+        if angular_speed < 1e-6:
+            drag_torque = np.zeros(3)
+        else:
+            angular_velocity_dir = angular_velocity / angular_speed
+            torque_magnitude = self.angular_drag_coefficient * (angular_speed ** 2)
+            drag_torque = -torque_magnitude * angular_velocity_dir
+            drag_torque *= submersion_ratio
+
+        return drag_force, drag_torque
+    
+    def _get_dynamic_cross_sectional_area(self, rotation_matrix, velocity_direction):
+        """
+        Calculates the projected area of the cube facing the velocity vector.
+        """
+        # Transform the local face normals into world space
+        world_face_normals = (rotation_matrix @ self._local_face_normals.T).T
+
+        # Ensure the velocity direction is a 1D array to prevent shape mismatch errors
+        velocity_direction_flat = velocity_direction.flatten()
+        
+        # Calculate the dot product between each world face normal and the velocity direction.
+        # We take the absolute value and only consider faces pointing against the flow (dot product < 0).
+        projected_areas = np.maximum(0, -np.dot(world_face_normals, velocity_direction_flat)) * self._face_areas
+        
+        # The total cross-sectional area is the sum of these projected areas
+        return np.sum(projected_areas)
 
     def _quaternion_to_euler(self, quaternion):
         """
@@ -166,3 +215,23 @@ class Hydrodynamics:
             [-x, 0, -z], [0, 0, -z], [+x, 0, -z],
             [-x, -y, -z], [0, -y, -z], [+x, -y, -z]
         ])
+    
+    def _create_cube_facepoints(self):
+        """
+        Define the areas of the cube's faces and the normals for each face in local space
+        """
+        face_areas = np.array([
+            self.depth * self.height,  # Right face (+X)
+            self.depth * self.height,  # Left face (-X)
+            self.width * self.height,  # Front face (+Y)
+            self.width * self.height,  # Back face (-Y)
+            self.width * self.depth,   # Top face (+Z)
+            self.width * self.depth,   # Bottom face (-Z)
+        ])
+        local_face_normals = np.array([
+            [1, 0, 0], [-1, 0, 0],
+            [0, 1, 0], [0, -1, 0],
+            [0, 0, 1], [0, 0, -1]
+        ])
+
+        return face_areas, local_face_normals

@@ -14,8 +14,10 @@ class LogVelocity(BehaviorScript):
     def on_play(self):
         self._setup()
 
-        header = ['timestamp', 'z_position', 'linear_velocity_z', 'angular_velocity_z',
-                  'x_position', 'linear_velocity_x', 'angular_velocity_x']
+        header = ['timestamp', 
+                  'z_position', 'linear_velocity_z', 'angular_velocity_z',
+                  'x_position', 'linear_velocity_x', 'angular_velocity_x',
+                  'y_position', 'linear_velocity_y', 'angular_velocity_y']
         try:
             with open(self._log_file_path, 'w', newline='') as f:
                 writer = csv.writer(f)
@@ -40,7 +42,10 @@ class LogVelocity(BehaviorScript):
             angular_velocity[0][2],
             position[0],
             linear_velocity[0][0],
-            angular_velocity[0][0]
+            angular_velocity[0][0],
+            position[1],
+            linear_velocity[0][1],
+            angular_velocity[0][1]
         ]
         try:
             with open(self._log_file_path, 'a', newline='') as f:

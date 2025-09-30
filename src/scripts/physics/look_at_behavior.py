@@ -16,7 +16,7 @@ from isaacsim.replicator.behavior.utils.scene_utils import (
     set_location
 )
 from omni.kit.scripting import BehaviorScript
-from pxr import Gf, Sdf, Usd, UsdGeom
+from pxr import Gf, Sdf, UsdGeom
 
 
 class LookAtBehavior(BehaviorScript):
@@ -68,6 +68,7 @@ class LookAtBehavior(BehaviorScript):
 
     def on_init(self):
         """Called when the script is assigned to a prim."""
+        self._target_location = Gf.Vec3d(0.0, 0.0, 0.0)
         self._target_prim = None
         self._up_axis = Gf.Vec3d(0.0, 0.0, 1.0)
         self._update_counter = 0

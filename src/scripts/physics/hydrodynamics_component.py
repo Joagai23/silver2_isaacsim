@@ -22,6 +22,7 @@ import os
 class HydrodynamicsComponent(BehaviorScript):
     """
     Behavior script that applies buoyancy and drag forces to a rigid body.
+    Hydrodynamics are modeled based on a cube with uniformed material density.
     """
     BEHAVIOR_NS = "hydrodynamicsBehavior"
 
@@ -57,16 +58,16 @@ class HydrodynamicsComponent(BehaviorScript):
             "doc": "Lenght of the object in the Z-axis in m.",
         },
         {
-            "attr_name": "maxLinearDamping",
+            "attr_name": "dragCoefficient",
             "attr_type": Sdf.ValueTypeNames.Float,
-            "default_value": 250.0,
-            "doc": "Max damping when fully submerged.",
+            "default_value": 0.8,
+            "doc": "Quantification of drag resistance when fully submerged.",
         },
         {
-            "attr_name": "maxAngularDamping",
+            "attr_name": "angularDragCoefficient",
             "attr_type": Sdf.ValueTypeNames.Float,
-            "default_value": 100.0,
-            "doc": "Max angular damping when fully submerged.",
+            "default_value": 0.5,
+            "doc": "Quantification of angular drag resistance when fully submerged.",
         },
     ]
 
@@ -123,7 +124,8 @@ class HydrodynamicsComponent(BehaviorScript):
     def _setup(self):
         """
         # Log Drag
-        header = ['timestamp', 'linear_drag_x', 'linear_drag_y', 'linear_drag_z',
+        header = ['timestamp', 
+                  'linear_drag_x', 'linear_drag_y', 'linear_drag_z',
                   'angular_drag_x', 'angular_drag_y', 'angular_drag_z']
         try:
             with open(self._log_file_path, 'w', newline='') as f:
@@ -149,15 +151,15 @@ class HydrodynamicsComponent(BehaviorScript):
         width = self._get_exposed_variable("width")
         depth = self._get_exposed_variable("depth")
         height = self._get_exposed_variable("height")
-        max_linear_damping = self._get_exposed_variable("maxLinearDamping")
-        max_angular_damping = self._get_exposed_variable("maxAngularDamping")
+        drag_coefficient = self._get_exposed_variable("dragCoefficient")
+        angular_drag_coefficient = self._get_exposed_variable("angularDragCoefficient")
 
         self._hydro_calculator = Hydrodynamics(
             width=width,
             depth=depth,
             height=height,
-            max_linear_damping=max_linear_damping,
-            max_angular_damping=max_angular_damping,
+            drag_coefficient=drag_coefficient,
+            angular_drag_coefficient=angular_drag_coefficient,
             water_density=water_density, 
             gravity=gravity
         )
@@ -184,7 +186,6 @@ class HydrodynamicsComponent(BehaviorScript):
             linear_vel=linear_velocity,
             angular_vel=angular_velocity
         )
-
         """
         # Log Drag
         log_row = [
@@ -192,9 +193,9 @@ class HydrodynamicsComponent(BehaviorScript):
             drag_force[0][0],
             drag_force[0][1],
             drag_force[0][2],
-            total_torque[0][0],
-            total_torque[0][1],
-            total_torque[0][2],
+            total_torque[0],
+            total_torque[1],
+            total_torque[2],
         ]
         try:
             with open(self._log_file_path, 'a', newline='') as f:
@@ -203,7 +204,6 @@ class HydrodynamicsComponent(BehaviorScript):
         except Exception as e:
             carb.log_warn(f"Failed to write to log file: {e}")
         """
-        
         # Apply the calculated force
         self._rigid_prim.apply_forces_and_torques_at_pos(
             forces=np.expand_dims(total_force, axis=0),

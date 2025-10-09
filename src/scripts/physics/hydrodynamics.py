@@ -3,91 +3,66 @@ import math
 
 class Hydrodynamics:
     """
-    A class to calculate hydrodynamic forces for an object (Buoyancy and Drag).
+    A class to calculate hydrodynamic forces using advanced models:
+    - Multi-point buoyancy with Center of Buoyancy calculation.
+    - Hybrid drag (linear + quadratic) with dynamic cross-sectional area and Center of Pressure.
+    - Simplified lift force model.
+    - 6x6 Added Mass matrix for realistic inertial effects.
     """
-    def __init__(self, width, depth, height, drag_coefficient, angular_drag_coefficient, linear_damping, angular_damping, water_density, gravity):
+    def __init__(self, width, depth, height, drag_coefficient, angular_drag_coefficient, 
+                 linear_damping, angular_damping, water_density, gravity, added_mass_matrix, lift_coefficient):
+        # Cube properties
         self.width = width
         self.depth = depth
         self.height = height
+        self.total_volume = width * depth * height
+        # Environment properties
         self.water_density = water_density
         self.gravity = gravity
+        # Physics coefficients
         self.drag_coefficient = drag_coefficient
         self.angular_drag_coefficient = angular_drag_coefficient
         self.linear_damping = linear_damping
         self.angular_damping = angular_damping
-        self.total_volume = width * depth * height
-
+        self.added_mass_matrix = added_mass_matrix
+        self.lift_coefficient = lift_coefficient
+        # Pre-calculated geometry
         self._face_areas, self._local_face_normals = self._create_cube_facepoints()
         self._local_keypoints, self._local_face_centers = self._create_cube_keypoints()
 
-    def calculate_hydrodynamic_forces(self, position, orientation_quat, linear_vel, angular_vel):
+    def calculate_hydrodynamic_forces(self, position, orientation_quat, linear_vel, angular_vel, linear_accel, angular_accel):
         """
-        Calculates and returns all hydrodynamic forces and torques acting on the object.
+        Calculates and returns all hydrodynamic forces, torques, and points of application.
         """
         roll, pitch, yaw = self._quaternion_to_euler(orientation_quat)
         rotation_matrix = self._get_rotation_matrix(roll, pitch, yaw)
-        world_corners = self._get_world_corners(position, rotation_matrix)
+        world_keypoints = self._get_world_corners(position, rotation_matrix)
 
-        if world_corners is None:
-            zeros = np.zeros(3)
-            return zeros, zeros
+        if world_keypoints is None:
+            return np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), position, position
 
-        submerged_count = np.sum(world_corners[:, 2] < 0)
-        submersion_ratio = submerged_count / 27
+        submerged_keypoints = world_keypoints[world_keypoints[:, 2] < 0]
+        submersion_ratio = self._calculate_submerged_ratio(world_keypoints)
 
         buoyancy_force = self._calculate_buoyancy(submersion_ratio)
         drag_force, drag_torque = self._calculate_hybrid_drag(submersion_ratio, linear_vel, angular_vel, rotation_matrix)
-        lift_force = self._calculate_lift(submersion_ratio, linear_vel, rotation_matrix)
+        #lift_force = self._calculate_lift(submersion_ratio, linear_vel, rotation_matrix)
+        lift_force = np.zeros(3)
+        added_mass_force, added_mass_torque = self._calculate_added_mass(linear_accel, angular_accel, rotation_matrix)
 
-        center_of_buoyancy, center_of_pressure = self._calculate_centers_of_pressure(world_corners, position, rotation_matrix, linear_vel)
+        center_of_buoyancy, center_of_pressure = self._calculate_centers_of_pressure(submerged_keypoints, position, rotation_matrix, linear_vel)
         
-        return buoyancy_force, drag_force, lift_force, drag_torque, center_of_buoyancy, center_of_pressure
+        return buoyancy_force, drag_force, lift_force, drag_torque, added_mass_force, added_mass_torque, center_of_buoyancy, center_of_pressure
     
     def _calculate_buoyancy(self, submersion_ratio):
         """
             Calculates the buoyancy force vector based on submergence and orientation.
-
-            Args:
-                submersion_ratio (float): Approximate value of the object that is underwater (Z < 0.0).
-
-            Returns:
-                np.array: A 3D vector representing the buoyancy force in the world coordinate frame.
         """
         submerged_volume = submersion_ratio * self.total_volume
         buoyancy_magnitude = self.water_density * submerged_volume * self.gravity   
         buoyancy_vector = np.array([0.0, 0.0, buoyancy_magnitude])
 
         return buoyancy_vector
-    
-        """
-        Calculates drag force and torque using the quadratic drag formula.
-        Fd = 0.5 * rho * u^2 * Cd * A
-        """
-        # Linear Drag
-        speed = np.linalg.norm(linear_velocity)
-        
-        if speed < 1e-6:
-            drag_force = np.zeros(3)
-        else:
-            velocity_direction = linear_velocity / speed
-            dynamic_area = self._get_dynamic_cross_sectional_area(rotation_matrix, velocity_direction)
-
-            drag_magnitude = 0.5 * self.water_density * (speed ** 2) * self.drag_coefficient * dynamic_area
-            drag_force = -drag_magnitude * velocity_direction
-            drag_force *= submersion_ratio
-
-        # Angular Drag (simplified quadratic model)
-        angular_speed = np.linalg.norm(angular_velocity)
-
-        if angular_speed < 1e-6:
-            drag_torque = np.zeros(3)
-        else:
-            angular_velocity_dir = angular_velocity / angular_speed
-            torque_magnitude = self.angular_drag_coefficient * (angular_speed ** 2)
-            drag_torque = -torque_magnitude * angular_velocity_dir
-            drag_torque *= submersion_ratio
-
-        return drag_force, drag_torque
     
     def _calculate_hybrid_drag(self, submersion_ratio, linear_velocity, angular_velocity, rotation_matrix):
         """
@@ -107,9 +82,8 @@ class Hydrodynamics:
             drag_magnitude = 0.5 * self.water_density * (speed ** 2) * self.drag_coefficient * dynamic_area
             quadratic_drag_force = -drag_magnitude * velocity_direction
         # Linear Drag (Provides stability at lower speeds)
-        linear_damping_coeff = self.drag_coefficient * self.linear_damping
         damping_scale_factor = min(1.0, speed / LOW_SPEED_THRESHOLD)
-        linear_drag_force = -linear_damping_coeff * linear_velocity * damping_scale_factor
+        linear_drag_force = -self.linear_damping * linear_velocity * damping_scale_factor
         # Combine forces and scale them based on object submersion
         drag_force = (quadratic_drag_force + linear_drag_force) * submersion_ratio
 
@@ -128,25 +102,25 @@ class Hydrodynamics:
 
     def _calculate_lift(self, submersion_ratio, linear_velocity, rotation_matrix):
         """
-        Calculates a simplified lift force.
-        This model assumes lift is generated primarily by the pitch angle.
+        Calculates a simplified lift force based on the direction of incoming fluid (object's velocity) and the cube's
+        "up" direction
         """
         speed = np.linalg.norm(linear_velocity)
         if speed < 1e-6:
             return np.zeros(3)
         velocity_direction = linear_velocity / speed
 
-        # Calculate Angle of Attack
+        # Calculate Angle of Attack between the object's "up" direction and the fluid flow
         up_vector = rotation_matrix[:, 2]
-        world_up = np.array([0, 0, 1])
-        dot_product = np.dot(up_vector, world_up)
-        dot_product_clipped = np.clip(dot_product, -1.0, 1.0)
-        attack_angle = np.arccos(dot_product_clipped)
+        # sin(AoA) = -up_vector · velocity_direction
+        dot_product = -np.dot(up_vector, velocity_direction)
+        angle_of_attack = np.arcsin(np.clip(dot_product, -1.0, 1.0))
 
         # Calculate Lift Magnitude
-        lift_coefficient = np.sin(2 * attack_angle) # Use 2 Amplifying heuristic for now
+        calculated_lift_coefficient = np.sin(2 * angle_of_attack)
         cross_sectional_area = self._get_dynamic_cross_sectional_area(rotation_matrix, velocity_direction)
-        lift_magnitude = 0.5 * self.water_density * (speed ** 2) * lift_coefficient * cross_sectional_area
+        lift_magnitude = 0.5 * self.water_density * (speed ** 2) * calculated_lift_coefficient * cross_sectional_area
+        lift_magnitude *= self.lift_coefficient 
 
         # Calculate Lift Direction (Perpendicular to velocity)
         right_vector = rotation_matrix[:, 0]
@@ -155,10 +129,102 @@ class Hydrodynamics:
 
         # Calculate and return final Lift Force
         lift_force = lift_magnitude * norm_lift_direction * submersion_ratio
-        if np.any(np.isnan(lift_force)):
-            return np.zeros(3)
         
         return lift_force
+
+    def _calculate_added_mass(self, linear_accel_world, angular_accel_world, rotation_matrix):
+        """
+        Calculates added mass forces and torques using a 6x6 matrix in the body frame.
+        """
+        # The inverse of a rotation matrix is its transpose
+        rotation_matrix_transpose = rotation_matrix.T
+
+        # Rotate world-space accelerations into the object's local (body) frame
+        linear_accel_local = rotation_matrix_transpose @ linear_accel_world
+        angular_accel_local = rotation_matrix_transpose @ angular_accel_world
+
+        # Create a 6-DOF acceleration vector
+        accel_vector_local = np.concatenate([linear_accel_local, angular_accel_local])
+
+        # Calculate forces and torques in the local frame: F = -M_a * a
+        force_torque_vector_local = -self.added_mass_matrix @ accel_vector_local
+
+        # Split the 6-DOF result back into 3D force and torque vectors
+        force_local = force_torque_vector_local[:3]
+        torque_local = force_torque_vector_local[3:]
+
+        # Rotate the calculated forces and torques back into the world frame to be applied
+        force_world = rotation_matrix @ force_local
+        torque_world = rotation_matrix @ torque_local
+        
+        return force_world, torque_world
+
+    def _calculate_centers_of_pressure(self, submerged_keypoints, position, rotation_matrix, linear_velocity):
+        """
+        Calculates the Center of Buoyancy (CoB) and Center of Pressure (CoP)
+        by finding the average position of the submerged keypoints.
+        CoB is the geometric center of the submerged volume.
+        CoP is the area-weighted center of the faces resisting motion.
+
+        Args:
+            submerged_keypoints (np.array): An (N, 3) array of the object's submerged (Z < 0) keypoints in world space.
+            position (np.array): The object's world position.
+            rotation_matrix (np.array): The object's 3x3 rotation matrix.
+            velocity_direction (np.array): The normalized direction of the object's linear velocity.
+
+        Returns:
+            (np.array, np.array): A tuple containing the (center_of_buoyancy, center_of_pressure).
+        """
+        # --- 1. Calculate Center of Buoyancy (CoB) ---
+        if submerged_keypoints.shape[0] == 0:
+            return position, position     
+        # Center of Buoyancy is the average of submerged points' position
+        center_of_buoyancy = np.mean(submerged_keypoints, axis=0)
+
+        # --- 2. Calculate Center of Pressure (CoP) for Drag ---
+        # Transform local face properties to world space
+        world_face_normals = (rotation_matrix @ self._local_face_normals.T).T
+        world_face_centers = (rotation_matrix @ self._local_face_centers.T).T + position
+        # Calculate the projected area of each face
+        speed = np.linalg.norm(linear_velocity)
+        velocity_direction = linear_velocity / speed
+        projected_areas = np.maximum(0, -np.dot(world_face_normals, velocity_direction.flatten())) * self._face_areas
+        total_projected_area = np.sum(projected_areas)
+
+        if total_projected_area < 1e-6:
+            # If no area is facing the flow, CoP is at the CoB as a fallback.
+            center_of_pressure = center_of_buoyancy
+        else:
+            # The CoP is the weighted average of the face centers, with the projected area as the weight.
+            weighted_centers = world_face_centers * projected_areas[:, np.newaxis]
+            center_of_pressure = np.sum(weighted_centers, axis=0) / total_projected_area
+
+        return center_of_buoyancy, center_of_pressure
+
+    def _calculate_submerged_ratio(self, world_keypoints):
+        """
+        Calculates a continuous submersion ratio based on the highest and lowest points
+        of the object, preventing the "sticking" effect at the water surface.
+        """
+        if world_keypoints.shape[0] == 0:
+            return 0.0
+
+        z_coords = world_keypoints[:, 2]
+        z_min = np.min(z_coords)
+        z_max = np.max(z_coords)
+
+        # Fully above water
+        if z_min >= 0:  
+            return 0.0
+        # Fully submerged
+        if z_max <= 0:
+            return 1.0
+        
+        # Partially submerged
+        total_effective_height = z_max - z_min
+        submerged_height = -z_min
+
+        return submerged_height / total_effective_height
 
     def _get_dynamic_cross_sectional_area(self, rotation_matrix, velocity_direction):
         """
@@ -245,49 +311,6 @@ class Hydrodynamics:
         world_corners_homogeneous = (transform_matrix @ local_corners_homogeneous.T).T
 
         return world_corners_homogeneous[:, :3]
-    
-    def _calculate_centers_of_pressure(self, world_keypoints, position, rotation_matrix, linear_velocity):
-        """
-        Calculates the Center of Buoyancy (CoB) and Center of Pressure (CoP)
-        by finding the average position of the submerged keypoints.
-        CoB is the geometric center of the submerged volume.
-        CoP is the area-weighted center of the faces resisting motion.
-
-        Args:
-            world_keypoints (np.array): An (N, 3) array of the object's keypoints in world space.
-            position (np.array): The object's world position.
-            rotation_matrix (np.array): The object's 3x3 rotation matrix.
-            velocity_direction (np.array): The normalized direction of the object's linear velocity.
-
-        Returns:
-            (np.array, np.array): A tuple containing the (center_of_buoyancy, center_of_pressure).
-        """
-        # --- 1. Calculate Center of Buoyancy (CoB) ---
-        submerged_points = world_keypoints[world_keypoints[:,2] < 0]
-        if submerged_points.shape[0] == 0:
-            return position, position     
-        # Center of Buoyancy is the average of submerged points' position
-        center_of_buoyancy = np.mean(submerged_points, axis=0)
-
-        # --- 2. Calculate Center of Pressure (CoP) for Drag ---
-        # Transform local face properties to world space
-        world_face_normals = (rotation_matrix @ self._local_face_normals.T).T
-        world_face_centers = (rotation_matrix @ self._local_face_centers.T).T + position
-        # Calculate the projected area of each face
-        speed = np.linalg.norm(linear_velocity)
-        velocity_direction = linear_velocity / speed
-        projected_areas = np.maximum(0, -np.dot(world_face_normals, velocity_direction.flatten())) * self._face_areas
-        total_projected_area = np.sum(projected_areas)
-
-        if total_projected_area < 1e-6:
-            # If no area is facing the flow, CoP is at the CoB as a fallback.
-            center_of_pressure = center_of_buoyancy
-        else:
-            # The CoP is the weighted average of the face centers, with the projected area as the weight.
-            weighted_centers = world_face_centers * projected_areas[:, np.newaxis]
-            center_of_pressure = np.sum(weighted_centers, axis=0) / total_projected_area
-
-        return center_of_buoyancy, center_of_pressure
 
     def _create_cube_keypoints(self):
         """

@@ -9,8 +9,8 @@ class Hydrodynamics:
     - Simplified lift force model.
     - 6x6 Added Mass matrix for realistic inertial effects.
     """
-    def __init__(self, width, depth, height, drag_coefficient, angular_drag_coefficient, 
-                 linear_damping, angular_damping, water_density, gravity, added_mass_matrix, lift_coefficient):
+    def __init__(self, width, depth, height, linear_drag_coefficient, angular_drag_coefficient, linear_damping, 
+                 angular_damping, water_density, gravity, linear_mass_coeff, angular_mass_coeff, lift_coefficient):
         # Cube properties
         self.width = width
         self.depth = depth
@@ -20,15 +20,16 @@ class Hydrodynamics:
         self.water_density = water_density
         self.gravity = gravity
         # Physics coefficients
-        self.drag_coefficient = drag_coefficient
+        self.linear_drag_coefficient = linear_drag_coefficient
         self.angular_drag_coefficient = angular_drag_coefficient
         self.linear_damping = linear_damping
         self.angular_damping = angular_damping
-        self.added_mass_matrix = added_mass_matrix
         self.lift_coefficient = lift_coefficient
         # Pre-calculated geometry
         self._face_areas, self._local_face_normals = self._create_cube_facepoints()
         self._local_keypoints, self._local_face_centers = self._create_cube_keypoints()
+        self._added_mass_matrix = self._create_added_mass_matrix(width, depth, height, self.total_volume, 
+                                                                 water_density, linear_mass_coeff, angular_mass_coeff)
 
     def calculate_hydrodynamic_forces(self, position, orientation_quat, linear_vel, angular_vel, linear_accel, angular_accel):
         """
@@ -44,15 +45,17 @@ class Hydrodynamics:
         submerged_keypoints = world_keypoints[world_keypoints[:, 2] < 0]
         submersion_ratio = self._calculate_submerged_ratio(world_keypoints)
 
+        if submersion_ratio <= 0:
+            return np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3),
+
         buoyancy_force = self._calculate_buoyancy(submersion_ratio)
         drag_force, drag_torque = self._calculate_hybrid_drag(submersion_ratio, linear_vel, angular_vel, rotation_matrix)
-        #lift_force = self._calculate_lift(submersion_ratio, linear_vel, rotation_matrix)
-        lift_force = np.zeros(3)
-        added_mass_force, added_mass_torque = self._calculate_added_mass(linear_accel, angular_accel, rotation_matrix)
+        lift_force = self._calculate_lift(submersion_ratio, linear_vel, rotation_matrix)
+        added_mass_force, added_mass_torque = self._calculate_added_mass(submersion_ratio, linear_accel, angular_accel, rotation_matrix)
 
         center_of_buoyancy, center_of_pressure = self._calculate_centers_of_pressure(submerged_keypoints, position, rotation_matrix, linear_vel)
         
-        return buoyancy_force, drag_force, lift_force, drag_torque, added_mass_force, added_mass_torque, center_of_buoyancy, center_of_pressure
+        return buoyancy_force, drag_force, lift_force, drag_torque, added_mass_force, added_mass_torque, center_of_buoyancy, center_of_pressure, submersion_ratio
     
     def _calculate_buoyancy(self, submersion_ratio):
         """
@@ -72,31 +75,35 @@ class Hydrodynamics:
         # A speed threshold below which damping is softened to prevent oscillation
         LOW_SPEED_THRESHOLD = 0.2
 
-        # Quadratic Drag (Dominant at high speeds)
+        ## LINEAR VELOCITY
+        # Quadratic Drag
         speed = np.linalg.norm(linear_velocity)
         if speed < 1e-6:
             quadratic_drag_force = np.zeros(3)
         else:
             velocity_direction = linear_velocity / speed
             dynamic_area = self._get_dynamic_cross_sectional_area(rotation_matrix, velocity_direction)
-            drag_magnitude = 0.5 * self.water_density * (speed ** 2) * self.drag_coefficient * dynamic_area
+            drag_magnitude = 0.5 * self.water_density * (speed ** 2) * self.linear_drag_coefficient * dynamic_area
             quadratic_drag_force = -drag_magnitude * velocity_direction
-        # Linear Drag (Provides stability at lower speeds)
+        # Linear Drag
         damping_scale_factor = min(1.0, speed / LOW_SPEED_THRESHOLD)
         linear_drag_force = -self.linear_damping * linear_velocity * damping_scale_factor
         # Combine forces and scale them based on object submersion
         drag_force = (quadratic_drag_force + linear_drag_force) * submersion_ratio
 
-        # Angular Drag (Hybrid model)
+        ## ANGULAR VELOCITY
+        # Quadratic Drag
         angular_speed = np.linalg.norm(angular_velocity)
         if angular_speed < 1e-6:
-            drag_torque = np.zeros(3)
+            angular_quadratic_drag_torque = np.zeros(3)
         else:
-            angular_velocity_dir = angular_velocity / angular_speed
-            quadratic_torque_magnitude = self.angular_drag_coefficient * (angular_speed ** 2)
-            linear_torque_magnitude = self.angular_damping * angular_speed
-            drag_torque = -(quadratic_torque_magnitude + linear_torque_magnitude) * angular_velocity_dir
-            drag_torque *= submersion_ratio
+            angular_velocity_direction = angular_velocity / angular_speed
+            angular_drag_magnitude = 0.5 * self.water_density * (angular_speed ** 2) * self.angular_drag_coefficient * self.total_volume
+            angular_quadratic_drag_torque = -angular_drag_magnitude * angular_velocity_direction
+        # Linear Drag
+        angular_damping_scale_factor = min(1.0, angular_speed / LOW_SPEED_THRESHOLD)
+        linear_angular_drag_torque = -self.angular_damping * angular_velocity * angular_damping_scale_factor
+        drag_torque = (angular_quadratic_drag_torque + linear_angular_drag_torque) * submersion_ratio
 
         return drag_force, drag_torque
 
@@ -132,7 +139,7 @@ class Hydrodynamics:
         
         return lift_force
 
-    def _calculate_added_mass(self, linear_accel_world, angular_accel_world, rotation_matrix):
+    def _calculate_added_mass(self, submersion_ratio, linear_accel_world, angular_accel_world, rotation_matrix):
         """
         Calculates added mass forces and torques using a 6x6 matrix in the body frame.
         """
@@ -146,8 +153,8 @@ class Hydrodynamics:
         # Create a 6-DOF acceleration vector
         accel_vector_local = np.concatenate([linear_accel_local, angular_accel_local])
 
-        # Calculate forces and torques in the local frame: F = -M_a * a
-        force_torque_vector_local = -self.added_mass_matrix @ accel_vector_local
+        # Calculate forces and torques in the local frame: Fi = -Mij * Aj
+        force_torque_vector_local = -self._added_mass_matrix @ accel_vector_local
 
         # Split the 6-DOF result back into 3D force and torque vectors
         force_local = force_torque_vector_local[:3]
@@ -156,6 +163,10 @@ class Hydrodynamics:
         # Rotate the calculated forces and torques back into the world frame to be applied
         force_world = rotation_matrix @ force_local
         torque_world = rotation_matrix @ torque_local
+
+        # Scale using submersion ratio
+        force_world *= submersion_ratio
+        torque_world *= submersion_ratio
         
         return force_world, torque_world
 
@@ -365,3 +376,20 @@ class Hydrodynamics:
         ])
 
         return face_areas, local_face_normals
+    
+    def _create_added_mass_matrix(self, width, depth, height, volume, water_density, linear_mass_coeff, angular_mass_coeff):
+        """
+        Construct the 6x6 added mass matrix from the exposed diagonal terms
+        """ 
+        added_mass_diag = np.array([
+            # Linear resistance to acceleration is proportional to mass
+            volume * linear_mass_coeff * water_density,  # Surge (X)
+            volume * linear_mass_coeff * water_density,  # Sway (Y) 
+            volume * linear_mass_coeff * water_density,   # Heave (Z) 
+            
+            # Angular terms are proportional to the area moment of inertia
+            volume * (depth**2 + height**2) * angular_mass_coeff * water_density, # Roll 
+            volume * (width**2 + height**2) * angular_mass_coeff * water_density, # Pitch 
+            volume * (width**2 + depth**2) * angular_mass_coeff * water_density  # Yaw
+        ])
+        return np.diag(added_mass_diag)

@@ -110,32 +110,35 @@ class Hydrodynamics:
     def _calculate_lift(self, submersion_ratio, linear_velocity, rotation_matrix):
         """
         Calculates a simplified lift force based on the direction of incoming fluid (object's velocity) and the cube's
-        "up" direction
+        "up" direction.
         """
         speed = np.linalg.norm(linear_velocity)
         if speed < 1e-6:
             return np.zeros(3)
         velocity_direction = linear_velocity / speed
 
-        # Calculate Angle of Attack between the object's "up" direction and the fluid flow
+        # The object's 'up' vector in world coordinates
         up_vector = rotation_matrix[:, 2]
-        # sin(AoA) = -up_vector · velocity_direction
+        # Calculate Angle of Attack
         dot_product = -np.dot(up_vector, velocity_direction)
         angle_of_attack = np.arcsin(np.clip(dot_product, -1.0, 1.0))
 
-        # Calculate Lift Magnitude
+        # Calculate Lift Magnitude using a flat plate approximation
         calculated_lift_coefficient = np.sin(2 * angle_of_attack)
         cross_sectional_area = self._get_dynamic_cross_sectional_area(rotation_matrix, velocity_direction)
         lift_magnitude = 0.5 * self.water_density * (speed ** 2) * calculated_lift_coefficient * cross_sectional_area
         lift_magnitude *= self.lift_coefficient 
 
-        # Calculate Lift Direction (Perpendicular to velocity)
-        right_vector = rotation_matrix[:, 0]
-        lift_direction = np.cross(velocity_direction, right_vector)
-        norm_lift_direction = lift_direction / (np.linalg.norm(lift_direction) + 1e-6)
+        # Calculate Lift Direction (Perpendicular to velocity and within plane velocity/up)
+        lift_axis = np.cross(velocity_direction, up_vector)
+        norm_lift_axis = np.linalg.norm(lift_axis)
+        if norm_lift_axis < 1e-6:
+            return np.zeros(3)
+        lift_axis /= norm_lift_axis
 
-        # Calculate and return final Lift Force
-        lift_force = lift_magnitude * norm_lift_direction * submersion_ratio
+        # The lift direction is perpendicular to both the flow and this new axis.
+        lift_direction = np.cross(lift_axis, velocity_direction)
+        lift_force = lift_magnitude * lift_direction * submersion_ratio
         
         return lift_force
 

@@ -19,7 +19,7 @@ import datetime
 import os
 
 
-class HydrodynamicsComponent(BehaviorScript):
+class HydrodynamicsBehavior(BehaviorScript):
     """
     Behavior script that applies buoyancy, drag, lift, and added mass forces to a rigid body.
     Hydrodynamics are modeled based on a cube with uniformed material density.
@@ -43,20 +43,24 @@ class HydrodynamicsComponent(BehaviorScript):
         {"attr_name": "linearAddedMassCoefficient", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 0.05, "doc": "Added mass coefficient for surge, sway, and heave acceleration."},
         {"attr_name": "angularAddedMassCoefficient", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 0.02, "doc": "Added mass coefficient for roll, pitch, and yaw acceleration."},
         # Lift Properties
-        {"attr_name": "liftCoefficient", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 1.0, "doc": "A multiplier for the overall strength of the lift force."}
+        {"attr_name": "liftCoefficient", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 1.0, "doc": "A multiplier for the overall strength of the lift force."},
+        # Log Properties
+        {"attr_name": "logData", "attr_type": Sdf.ValueTypeNames.Bool, "default_value": False, "doc": "Log drag and torque properties of the object."}
     ]
 
     def on_init(self):
-        # Log Drag
-        script_directory = os.path.dirname(__file__)
-        self._log_file_path = os.path.join(script_directory, "torque_log.csv")
-
         self._hydro_calculator = None
         self._rigid_prim = None
         self._last_linear_velocity = np.zeros(3)
         self._last_angular_velocity = np.zeros(3)
         create_exposed_variables(self.prim, EXPOSED_ATTR_NS, self.BEHAVIOR_NS, self.VARIABLES_TO_EXPOSE)
         omni.kit.window.property.get_window().request_rebuild()
+        self._log_data = False
+        # Log Drag and Torque
+        if bool(self._get_exposed_variable("logData")):
+            self._log_data = True
+            script_directory = os.path.dirname(__file__)
+            self._log_file_path = os.path.join(script_directory, "torque_log.csv")
 
     def on_destroy(self):
         self._reset()
@@ -76,20 +80,20 @@ class HydrodynamicsComponent(BehaviorScript):
         self._apply_behavior(delta_time)
     
     def _setup(self):
-        # Log Drag
-        header = ['timestamp', 'angular_velocity', 'torque_from_buoyancy', 'drag_torque', 'net_torque', 
-                  'position_z', 'submerssion_ratio', 'center_of_buoyancy', 'added_mass_force', 'added_mass_torque'
-                  'lift_force', 'torque_from_lift', 'orientation_quaternion']
-        try:
-            with open(self._log_file_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
-            carb.log_info(f"Log file created at {self._log_file_path}")
-        except Exception as e:
-            carb.log_error(f"Failed to create log file: {e}")
+        if self._log_data:
+            header = ['timestamp', 'angular_velocity', 'torque_from_buoyancy', 'drag_torque', 'net_torque', 
+                    'position_z', 'submerssion_ratio', 'center_of_buoyancy', 'added_mass_force', 'added_mass_torque'
+                    'lift_force', 'torque_from_lift', 'orientation_quaternion']
+            try:
+                with open(self._log_file_path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(header)
+                carb.log_info(f"Log file created at {self._log_file_path}")
+            except Exception as e:
+                carb.log_error(f"Failed to create log file: {e}")
 
         if not self.prim.HasAPI(UsdPhysics.RigidBodyAPI):
-            carb.log_warn(f"HydrodynamicsComponent on prim {self.prim_path} requires a RigidBody component.")
+            carb.log_warn(f"HydrodynamicsBehavior on prim {self.prim_path} requires a RigidBody component.")
             return
         
         self._rigid_prim = RigidPrim(str(self.prim_path))
@@ -108,7 +112,7 @@ class HydrodynamicsComponent(BehaviorScript):
             angular_mass_coeff = self._get_exposed_variable("angularAddedMassCoefficient"),
             lift_coefficient=self._get_exposed_variable("liftCoefficient")
         )
-        carb.log_info(f"HydrodynamicsComponent initialized for {self.prim_path}")
+        carb.log_info(f"HydrodynamicsBehavior initialized for {self.prim_path}")
     
     def _apply_behavior(self, delta_time):
         # Get current state from the simulator
@@ -156,28 +160,28 @@ class HydrodynamicsComponent(BehaviorScript):
         self._last_linear_velocity = linear_velocity
         self._last_angular_velocity = angular_velocity
 
-        # Log Drag
-        log_row = [
-            datetime.datetime.now().isoformat(),
-            angular_velocity,
-            torque_from_buoyancy,
-            drag_torque,
-            net_torque,
-            position[2],
-            submersion_ratio,
-            center_of_buoyancy,
-            added_mass_force,
-            added_mass_torque,
-            lift_force,
-            torque_from_lift,
-            orientation_quat
-        ]
-        try:
-            with open(self._log_file_path, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(log_row)
-        except Exception as e:
-            carb.log_warn(f"Failed to write to log file: {e}")
+        if self._log_data:
+            log_row = [
+                datetime.datetime.now().isoformat(),
+                angular_velocity,
+                torque_from_buoyancy,
+                drag_torque,
+                net_torque,
+                position[2],
+                submersion_ratio,
+                center_of_buoyancy,
+                added_mass_force,
+                added_mass_torque,
+                lift_force,
+                torque_from_lift,
+                orientation_quat
+            ]
+            try:
+                with open(self._log_file_path, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(log_row)
+            except Exception as e:
+                carb.log_warn(f"Failed to write to log file: {e}")
 
     def _reset(self):
         self._hydro_calculator = None

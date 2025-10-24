@@ -22,8 +22,7 @@ class AnimateWaterBehavior(BehaviorScript):
         {"attr_name": "yDirection", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 1.0, "doc": "Direction of current in the Y-axis."},
         {"attr_name": "xVelocity", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 0.02, "doc": "Magnitude of current in the X-axis."},
         {"attr_name": "yVelocity", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 0.02, "doc": "Magnitude of current in the Y-axis."},
-        {"attr_name": "oceanMaterial", "attr_type": Sdf.ValueTypeNames.String, "default_value": "/World/Looks/LightBlueOceanWater", "doc": "Material containing ocean shader."},
-        
+        {"attr_name": "oceanMaterial", "attr_type": Sdf.ValueTypeNames.String, "default_value": "/World/Looks/LightBlueOceanWater", "doc": "Material containing ocean shader."} 
     ]
     def on_init(self):
         # Read and process exposed variables

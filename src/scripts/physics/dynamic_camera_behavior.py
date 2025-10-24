@@ -1,10 +1,7 @@
-import carb
 import omni.kit.window.property
-import sys
-import os
 import numpy as np
 from omni.kit.scripting import BehaviorScript
-from pxr import Sdf, PhysxSchema, UsdGeom, Gf
+from pxr import Gf
 from isaacsim.replicator.behavior.utils.behavior_utils import create_exposed_variables, get_exposed_variable, check_if_exposed_variables_should_be_removed, remove_exposed_variables
 from isaacsim.replicator.behavior.global_variables import EXPOSED_ATTR_NS
 from .custom_keyboard_cmd import custom_keyboard_cmd
@@ -17,9 +14,27 @@ class DynamicCameraBehavior(BehaviorScript):
     def on_init(self):
         if custom_keyboard_cmd is None:
             return
-        self._rob_forceAPI = PhysxSchema.PhysxForceAPI.Apply(self.prim)
-        # Override keyboard class init parameters
-        # Deemed necessary as scripts using suscriptions are loaded into memory as soon as it is initialized
+
+        create_exposed_variables(self.prim, EXPOSED_ATTR_NS, self.BEHAVIOR_NS, self.VARIABLES_TO_EXPOSE)
+        omni.kit.window.property.get_window().request_rebuild()
+
+    def on_destroy(self):
+        if check_if_exposed_variables_should_be_removed(self.prim, __file__):
+            remove_exposed_variables(self.prim, EXPOSED_ATTR_NS, self.BEHAVIOR_NS, self.VARIABLES_TO_EXPOSE)
+            omni.kit.window.property.get_window().request_rebuild()
+
+    def on_play(self):
+        # Override keyboard class init parameters when scene starts
+        self._define_input_controller()
+
+    def on_update(self, current_time: float, delta_time: float):
+        # Get user input
+        position_input, rotation_input, change_target, switch_tracking = self._get_input()
+        print(position_input)
+        # Update Movement and Torque
+        self._calculate_movement_and_torque(position_input, rotation_input, delta_time)
+
+    def _define_input_controller(self):
         self._input_cmd = custom_keyboard_cmd(
             base_command = np.array([0.0, 0.0, 0.0]),
             input_keyboard_mapping = {
@@ -66,20 +81,6 @@ class DynamicCameraBehavior(BehaviorScript):
         )
         self._toggle_cmd = self._input_cmd._toggle_command
         self._tab_cmd = self._torque_cmd._toggle_command
-        create_exposed_variables(self.prim, EXPOSED_ATTR_NS, self.BEHAVIOR_NS, self.VARIABLES_TO_EXPOSE)
-        omni.kit.window.property.get_window().request_rebuild()
-
-    def on_destroy(self):
-        if check_if_exposed_variables_should_be_removed(self.prim, __file__):
-            remove_exposed_variables(self.prim, EXPOSED_ATTR_NS, self.BEHAVIOR_NS, self.VARIABLES_TO_EXPOSE)
-            omni.kit.window.property.get_window().request_rebuild()
-
-    def on_update(self, current_time: float, delta_time: float):
-        # Get user input
-        position_input, rotation_input, change_target, switch_tracking = self._get_input()
-        
-        # Update Movement and Torque
-        self._calculate_movement_and_torque(position_input, rotation_input, delta_time)
 
     def _get_input(self) -> tuple[Gf.Vec3f, Gf.Vec3f, bool, bool]:
         """

@@ -201,7 +201,10 @@ class Hydrodynamics:
         world_face_centers = (rotation_matrix @ self._local_face_centers.T).T + position
         # Calculate the projected area of each face
         speed = np.linalg.norm(linear_velocity)
-        velocity_direction = linear_velocity / speed
+        if speed < 1e-6:
+            velocity_direction = 0.0
+        else:
+            velocity_direction = linear_velocity / speed
         projected_areas = np.maximum(0, -np.dot(world_face_normals, velocity_direction.flatten())) * self._face_areas
         total_projected_area = np.sum(projected_areas)
 

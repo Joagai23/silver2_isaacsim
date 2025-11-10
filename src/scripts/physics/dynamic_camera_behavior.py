@@ -6,8 +6,7 @@ from pxr import Gf, Sdf, Usd, UsdPhysics
 from isaacsim.replicator.behavior.utils.behavior_utils import create_exposed_variables, get_exposed_variable, check_if_exposed_variables_should_be_removed, remove_exposed_variables
 from isaacsim.replicator.behavior.global_variables import EXPOSED_ATTR_NS
 from .custom_keyboard_cmd import custom_keyboard_cmd
-from isaacsim.replicator.behavior.utils.scene_utils import get_world_location, get_world_rotation, set_location, set_orientation, set_rotation_with_ops, get_rotation_op_and_value
-from omni.usd import get_world_transform_matrix
+from isaacsim.replicator.behavior.utils.scene_utils import get_world_location, get_world_rotation, set_location, set_orientation, set_rotation_with_ops
 from .ui_widget import UIWidget
 from .look_at import LookAt
 
@@ -19,8 +18,8 @@ class DynamicCameraBehavior(BehaviorScript):
     """
     BEHAVIOR_NS = "dynamicCameraBehavior"
     VARIABLES_TO_EXPOSE = [
-        {"attr_name": "linearVelocity", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 5.0, "doc": "Direction of current in the X-axis."},
-        {"attr_name": "angularVelocity", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 10.0, "doc": "Direction of current in the Y-axis."},
+        {"attr_name": "linearVelocity", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 10.0, "doc": "Magnitude of the camera's linear velocity."},
+        {"attr_name": "angularVelocity", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 15.0, "doc": "Magnitude of the camera's angular velocity."},
         {"attr_name": "worldPrim", "attr_type": Sdf.ValueTypeNames.String, "default_value": "/World", "doc": "Primitive containing all target bodies."},
     ]
 

@@ -6,7 +6,10 @@ import os
 from isaacsim.replicator.behavior.utils.behavior_utils import create_exposed_variables, get_exposed_variable, check_if_exposed_variables_should_be_removed, remove_exposed_variables
 from isaacsim.replicator.behavior.global_variables import EXPOSED_ATTR_NS
 from omni.kit.scripting import BehaviorScript
-from pxr import Sdf, UsdGeom
+from pxr import Sdf, UsdGeom, Gf
+from isaacsim.replicator.behavior.utils.scene_utils import get_world_location
+import numpy as np
+import warp as wp
 
 # Full path to OCEANSIM sensors folder
 OCEANSIM_SENSORS_PATH = os.path.expanduser("~/Documents/isaac-sim/extsUser/OceanSim/isaacsim/oceansim/sensors")
@@ -42,11 +45,23 @@ class UnderwaterCameraBehavior(BehaviorScript):
             "doc": "The height of the camera's render output.",
         },
         {
-            "attr_name": "uwYamlPath",
-            "attr_type": Sdf.ValueTypeNames.String,
-            "default_value": "",
-            "doc": "Optional path to a YAML file containing the underwater color parameters.",
+            "attr_name": "backscatterValue",
+            "attr_type": Sdf.ValueTypeNames.Vector3d,
+            "default_value": Gf.Vec3d(0.17, 0.33, 0.43),
+            "doc": "Underwater processing Backscatter Values.",
         },
+        {
+            "attr_name": "backscatterCoeff",
+            "attr_type": Sdf.ValueTypeNames.Vector3d,
+            "default_value": Gf.Vec3d(0.005, 0.003, 0.015),
+            "doc": "Underwater processing Backscatter Coefficients.",
+        },
+        {
+            "attr_name": "attenCoeff",
+            "attr_type": Sdf.ValueTypeNames.Vector3d,
+            "default_value": Gf.Vec3d(0.15, 0.05, 0.001),
+            "doc": "Underwater processing Attenuation Coefficients.",
+        }
     ]
 
     def on_init(self):
@@ -55,6 +70,9 @@ class UnderwaterCameraBehavior(BehaviorScript):
             return
         create_exposed_variables(self.prim, EXPOSED_ATTR_NS, self.BEHAVIOR_NS, self.VARIABLES_TO_EXPOSE)
         omni.kit.window.property.get_window().request_rebuild()
+        self._backscatter_value = wp.vec3f(self._get_exposed_variable("backscatterValue"))
+        self._backscatter_coeff = wp.vec3f(self._get_exposed_variable("backscatterCoeff"))
+        self._attenuation_coeff = wp.vec3f(self._get_exposed_variable("attenCoeff"))
 
     def on_destroy(self):
         self._cleanup()
@@ -63,6 +81,7 @@ class UnderwaterCameraBehavior(BehaviorScript):
             omni.kit.window.property.get_window().request_rebuild()
 
     def on_play(self):
+        self._height_state = -2
         if UW_Camera is None:
             carb.log_error("Cannot start UnderwaterCameraBehavior because UW_Camera class could not be imported.")
             return
@@ -89,15 +108,34 @@ class UnderwaterCameraBehavior(BehaviorScript):
             name=f"{self.prim.GetName()}_UW_Sensor",
             resolution=(width, height)
         )
-        self._uw_camera.initialize(viewport=True, UW_yaml_path=yaml_path)
+        self._uw_camera.initialize(viewport=True)
+        self._switch_camera()
         carb.log_info(f"UnderwaterCameraBehavior initialized for {self.prim_path}")
 
     def on_stop(self):
         self._cleanup()
 
     def on_update(self, current_time: float, delta_time: float):
+        self._switch_camera()
         if self._uw_camera:
             self._uw_camera.render()
+
+    def _switch_camera(self):
+        current_height_state = np.sign(get_world_location(self.prim)[2])
+        # Check change in state
+        if current_height_state != 0 and current_height_state != self._height_state:
+            # Change to above-water
+            if current_height_state > 0:
+                self._height_state = 1
+                self._uw_camera._backscatter_coeff = wp.vec3f(0.0, 0.0, 0.0)
+                self._uw_camera._backscatter_value = wp.vec3f(0.0, 0.0, 0.0)
+                self._uw_camera._atten_coeff = wp.vec3f(0.0, 0.0, 0.0)
+            # Change to underwater
+            else:
+                self._height_state = -1
+                self._uw_camera._backscatter_coeff = self._backscatter_coeff
+                self._uw_camera._backscatter_value = self._backscatter_value
+                self._uw_camera._atten_coeff = self._attenuation_coeff
 
     def _cleanup(self):
         """Closes the UW_Camera sensor and releases its resources."""

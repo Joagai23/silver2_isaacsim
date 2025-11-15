@@ -27,7 +27,7 @@ except ImportError as e:
 
 class UnderwaterCameraBehavior(BehaviorScript):
     """
-    Behavior script that applies the OceanSim underwater rendering effect to the camera it is attached to.
+    Behavior script that applies the OceanSim underwater rendering effect to the camera it is attached to..
     """
     BEHAVIOR_NS = "underwaterCameraBehavior"
 
@@ -47,19 +47,19 @@ class UnderwaterCameraBehavior(BehaviorScript):
         {
             "attr_name": "backscatterValue",
             "attr_type": Sdf.ValueTypeNames.Vector3d,
-            "default_value": Gf.Vec3d(0.17, 0.33, 0.43),
+            "default_value": Gf.Vec3d(0.063, 0.278, 0.345),
             "doc": "Underwater processing Backscatter Values.",
         },
         {
             "attr_name": "backscatterCoeff",
             "attr_type": Sdf.ValueTypeNames.Vector3d,
-            "default_value": Gf.Vec3d(0.005, 0.003, 0.015),
+            "default_value": Gf.Vec3d(0.04, 0.18, 0.22),
             "doc": "Underwater processing Backscatter Coefficients.",
         },
         {
             "attr_name": "attenCoeff",
             "attr_type": Sdf.ValueTypeNames.Vector3d,
-            "default_value": Gf.Vec3d(0.15, 0.05, 0.001),
+            "default_value": Gf.Vec3d(0.10, 0.03, 0.02),
             "doc": "Underwater processing Attenuation Coefficients.",
         }
     ]
@@ -73,6 +73,7 @@ class UnderwaterCameraBehavior(BehaviorScript):
         self._backscatter_value = wp.vec3f(self._get_exposed_variable("backscatterValue"))
         self._backscatter_coeff = wp.vec3f(self._get_exposed_variable("backscatterCoeff"))
         self._attenuation_coeff = wp.vec3f(self._get_exposed_variable("attenCoeff"))
+        self._height_state = -2
 
     def on_destroy(self):
         self._cleanup()
@@ -81,7 +82,6 @@ class UnderwaterCameraBehavior(BehaviorScript):
             omni.kit.window.property.get_window().request_rebuild()
 
     def on_play(self):
-        self._height_state = -2
         if UW_Camera is None:
             carb.log_error("Cannot start UnderwaterCameraBehavior because UW_Camera class could not be imported.")
             return

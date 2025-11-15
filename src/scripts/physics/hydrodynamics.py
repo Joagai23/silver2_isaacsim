@@ -40,13 +40,13 @@ class Hydrodynamics:
         world_keypoints = self._get_world_corners(position, rotation_matrix)
 
         if world_keypoints is None:
-            return np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), position, position
+            return np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), 0.0
 
         submerged_keypoints = world_keypoints[world_keypoints[:, 2] < 0]
         submersion_ratio = self._calculate_submerged_ratio(world_keypoints)
 
         if submersion_ratio <= 0:
-            return np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3),
+            return np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), 0.0
 
         buoyancy_force = self._calculate_buoyancy(submersion_ratio)
         drag_force, drag_torque = self._calculate_hybrid_drag(submersion_ratio, linear_vel, angular_vel, rotation_matrix)
@@ -202,7 +202,7 @@ class Hydrodynamics:
         # Calculate the projected area of each face
         speed = np.linalg.norm(linear_velocity)
         if speed < 1e-6:
-            velocity_direction = 0.0
+            velocity_direction = np.zeros(3)
         else:
             velocity_direction = linear_velocity / speed
         projected_areas = np.maximum(0, -np.dot(world_face_normals, velocity_direction.flatten())) * self._face_areas
@@ -240,6 +240,13 @@ class Hydrodynamics:
         # Partially submerged
         total_effective_height = z_max - z_min
         submerged_height = -z_min
+
+        # Check and prevent zero division  for thin objects
+        if total_effective_height < 1e-6:
+            if z_min >= 0:
+                return 0.0
+            else:
+                return 1.0
 
         return submerged_height / total_effective_height
 

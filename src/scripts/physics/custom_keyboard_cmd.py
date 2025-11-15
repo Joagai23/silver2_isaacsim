@@ -11,7 +11,6 @@
 
 import carb
 import numpy as np
-import omni
 import omni.appwindow
 
 # THis can only be used after the scene is loaded 

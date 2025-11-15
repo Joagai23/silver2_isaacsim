@@ -31,9 +31,9 @@ class HydrodynamicsBehavior(BehaviorScript):
         {"attr_name": "waterDensity", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 1025.0, "doc": "Density of the fluid in kg/m^3."},
         {"attr_name": "gravity", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 9.81, "doc": "Gravitational acceleration in m/s^2."},
         # Object Dimensions
-        {"attr_name": "width", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 1.0, "doc": "Object dimension along its local X-axis (m)."},
-        {"attr_name": "depth", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 1.0, "doc": "Object dimension along its local Y-axis (m)."},
-        {"attr_name": "height", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 1.0, "doc": "Object dimension along its local Z-axis (m)."},
+        {"attr_name": "xDimension", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 1.0, "doc": "Object dimension along its local X-axis (m)."},
+        {"attr_name": "yDimension", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 1.0, "doc": "Object dimension along its local Y-axis (m)."},
+        {"attr_name": "zDimension", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 1.0, "doc": "Object dimension along its local Z-axis (m)."},
         # Drag Properties
         {"attr_name": "linearDragCoefficient", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 1.2, "doc": "Quadratic linear drag coefficient (Cd)."},
         {"attr_name": "angularDragCoefficient", "attr_type": Sdf.ValueTypeNames.Float, "default_value": 0.8, "doc": "Quadratic angular drag coefficient."},
@@ -77,7 +77,8 @@ class HydrodynamicsBehavior(BehaviorScript):
     def on_update(self, current_time: float, delta_time: float):
         if delta_time <= 1e-6 or self._rigid_prim is None:
             return
-        self._apply_behavior(delta_time)
+        if not self._break_stop:
+            self._apply_behavior(delta_time)
     
     def _setup(self):
         if self._log_data:
@@ -99,9 +100,9 @@ class HydrodynamicsBehavior(BehaviorScript):
         self._rigid_prim = RigidPrim(str(self.prim_path))
 
         self._hydro_calculator = Hydrodynamics(
-            width=self._get_exposed_variable("width"), 
-            depth=self._get_exposed_variable("depth"), 
-            height=self._get_exposed_variable("height"),
+            width=self._get_exposed_variable("xDimension"), 
+            depth=self._get_exposed_variable("yDimension"), 
+            height=self._get_exposed_variable("zDimension"),
             linear_drag_coefficient=self._get_exposed_variable("linearDragCoefficient"),
             angular_drag_coefficient=self._get_exposed_variable("angularDragCoefficient"),
             linear_damping=self._get_exposed_variable("linearDamping"),
@@ -112,6 +113,7 @@ class HydrodynamicsBehavior(BehaviorScript):
             angular_mass_coeff = self._get_exposed_variable("angularAddedMassCoefficient"),
             lift_coefficient=self._get_exposed_variable("liftCoefficient")
         )
+        self._break_stop = False
         carb.log_info(f"HydrodynamicsBehavior initialized for {self.prim_path}")
     
     def _apply_behavior(self, delta_time):
@@ -122,6 +124,22 @@ class HydrodynamicsBehavior(BehaviorScript):
         linear_velocity = self._rigid_prim.get_linear_velocities()[0]
         angular_velocity = self._rigid_prim.get_angular_velocities()[0]
 
+        stop = False
+        if np.any(np.isnan(positions)):
+            print("Behavior Positions is NAN")
+            stop = True
+        if np.any(np.isnan(orientations)):
+            print("Behavior Orientations is NAN")
+            stop = True
+        if np.any(np.isnan(linear_velocity)):
+            print("Behavior LinearVel is NAN")
+            stop = True
+        if np.any(np.isnan(angular_velocity)):
+            print("Behavior AngularVel is NAN")
+            stop = True
+
+        if stop:
+            self._break_stop = True
         # Estimate acceleration
         linear_acceleration = (linear_velocity - self._last_linear_velocity) / delta_time
         angular_acceleration = (angular_velocity - self._last_angular_velocity) / delta_time
@@ -145,8 +163,8 @@ class HydrodynamicsBehavior(BehaviorScript):
         torque_from_lift = np.cross(center_of_buoyancy - position, lift_force)
 
         # Sum forces and torques to get net values
-        net_force = buoyancy_force + drag_force + added_mass_force + lift_force
-        net_torque = torque_from_buoyancy + torque_from_drag + drag_torque + added_mass_torque + torque_from_lift
+        net_force = buoyancy_force + drag_force + lift_force #+ added_mass_force
+        net_torque = torque_from_buoyancy + torque_from_drag + drag_torque + torque_from_lift #+ added_mass_torque
         
         # Apply the calculated forces and torques
         self._rigid_prim.apply_forces_and_torques_at_pos(

@@ -8,7 +8,7 @@ import carb
 import numpy as np
 
 class LookAt:
-    def __init__(self, camera_prim, stage:Usd.Stage, follow_distance=10.0, follow_damping=5.0):
+    def __init__(self, camera_prim, stage:Usd.Stage, follow_distance=100.0, follow_damping=5.0):
         self._up_axis = Gf.Vec3d(0.0, 0.0, 1.0)
         self._follow_distance = follow_distance
         self._follow_damping = follow_damping

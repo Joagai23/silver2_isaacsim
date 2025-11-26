@@ -1,6 +1,7 @@
 import carb
 import omni.kit.window.property
 import numpy as np
+import omni.physx
 from isaacsim.replicator.behavior.global_variables import EXPOSED_ATTR_NS
 from isaacsim.replicator.behavior.utils.behavior_utils import (
     check_if_exposed_variables_should_be_removed,
@@ -53,8 +54,12 @@ class HydrodynamicsBehavior(BehaviorScript):
         self._rigid_prim = None
         self._last_linear_velocity = np.zeros(3)
         self._last_angular_velocity = np.zeros(3)
+
+        self._physx_subscription = None
+
         create_exposed_variables(self.prim, EXPOSED_ATTR_NS, self.BEHAVIOR_NS, self.VARIABLES_TO_EXPOSE)
         omni.kit.window.property.get_window().request_rebuild()
+        
         self._log_data = False
         # Log Drag and Torque
         if bool(self._get_exposed_variable("logData")):
@@ -70,16 +75,22 @@ class HydrodynamicsBehavior(BehaviorScript):
 
     def on_play(self):
         self._setup()
+        physx_interface = omni.physx.get_physx_interface()
+        self._physx_subscription = physx_interface.subscribe_physics_step_events(self._on_physics_step)
 
     def on_stop(self):
         self._reset()
     
+    # RenderUpdate
     def on_update(self, current_time: float, delta_time: float):
+        pass
+
+    # FixedUpdate
+    def _on_physics_step(self, delta_time:float):
         if delta_time <= 1e-6 or self._rigid_prim is None:
             return
-        if not self._break_stop:
-            self._apply_behavior(delta_time)
-    
+        self._apply_behavior(delta_time)
+
     def _setup(self):
         if self._log_data:
             header = ['timestamp', 'angular_velocity', 'torque_from_buoyancy', 'drag_torque', 'net_torque', 
@@ -113,9 +124,8 @@ class HydrodynamicsBehavior(BehaviorScript):
             angular_mass_coeff = self._get_exposed_variable("angularAddedMassCoefficient"),
             lift_coefficient=self._get_exposed_variable("liftCoefficient")
         )
-        self._break_stop = False
         carb.log_info(f"HydrodynamicsBehavior initialized for {self.prim_path}")
-    
+
     def _apply_behavior(self, delta_time):
         # Get current state from the simulator
         positions, orientations = self._rigid_prim.get_world_poses()
@@ -124,22 +134,6 @@ class HydrodynamicsBehavior(BehaviorScript):
         linear_velocity = self._rigid_prim.get_linear_velocities()[0]
         angular_velocity = self._rigid_prim.get_angular_velocities()[0]
 
-        stop = False
-        if np.any(np.isnan(positions)):
-            print("Behavior Positions is NAN")
-            stop = True
-        if np.any(np.isnan(orientations)):
-            print("Behavior Orientations is NAN")
-            stop = True
-        if np.any(np.isnan(linear_velocity)):
-            print("Behavior LinearVel is NAN")
-            stop = True
-        if np.any(np.isnan(angular_velocity)):
-            print("Behavior AngularVel is NAN")
-            stop = True
-
-        if stop:
-            self._break_stop = True
         # Estimate acceleration
         linear_acceleration = (linear_velocity - self._last_linear_velocity) / delta_time
         angular_acceleration = (angular_velocity - self._last_angular_velocity) / delta_time
@@ -206,6 +200,7 @@ class HydrodynamicsBehavior(BehaviorScript):
         self._rigid_prim = None
         self._last_linear_velocity = np.zeros(3)
         self._last_angular_velocity = np.zeros(3)
+        self._physx_subscription = None
 
     def _get_exposed_variable(self, attr_name):
         full_attr_name = f"{EXPOSED_ATTR_NS}:{self.BEHAVIOR_NS}:{attr_name}"

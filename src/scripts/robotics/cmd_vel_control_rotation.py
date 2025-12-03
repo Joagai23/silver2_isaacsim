@@ -3,9 +3,8 @@
 # Author: Giacomo Picardi (modified for cmd_vel integration)
 # Maintainer: Jorge Aguirregomezcorta Aina (modified for Isaac Sim)
 
-import os, sys, time, signal
+import sys, time, signal
 import numpy as np
-import matplotlib.pyplot as plt
 
 import rclpy
 from rclpy.node import Node
@@ -25,7 +24,7 @@ class OmnidirectionalGaitController(Node):
     def __init__(self):
         super().__init__('omnidirectional_gait_controller')
 
-        # Fixed gait parameters (Gazebo ones)
+        # Fixed gait parameters
         self.gait_width = 40.0
         self.gait_height = 30.0
         self.step_length = 20.0

@@ -2,6 +2,7 @@ import carb
 import omni.kit.window.property
 import numpy as np
 import omni.physx
+import warp as wp
 from isaacsim.replicator.behavior.global_variables import EXPOSED_ATTR_NS
 from isaacsim.replicator.behavior.utils.behavior_utils import (
     check_if_exposed_variables_should_be_removed,
@@ -12,7 +13,7 @@ from isaacsim.replicator.behavior.utils.behavior_utils import (
 from omni.kit.scripting import BehaviorScript
 from pxr import Sdf, UsdPhysics
 from isaacsim.core.prims import RigidPrim
-from .hydrodynamics import Hydrodynamics
+from .warp_hydrodynamics_wrapper import WarpHydrodynamicsWrapper
 
 class HydrodynamicsBehavior(BehaviorScript):
     """
@@ -46,8 +47,14 @@ class HydrodynamicsBehavior(BehaviorScript):
         self._rigid_prim = None
         self._last_linear_velocity = np.zeros(3, dtype=np.float64)
         self._last_angular_velocity = np.zeros(3, dtype=np.float64)
-
+        
+        # Physics-based update
         self._physx_subscription = None
+        # Initialize Warp Global
+        try:
+            wp.init()
+        except Exception as e:
+            carb.log_error(f"Failed to initialize NVIDIA Warp: {e}")
 
         create_exposed_variables(self.prim, EXPOSED_ATTR_NS, self.BEHAVIOR_NS, self.VARIABLES_TO_EXPOSE)
         omni.kit.window.property.get_window().request_rebuild()
@@ -65,10 +72,6 @@ class HydrodynamicsBehavior(BehaviorScript):
 
     def on_stop(self):
         self._reset()
-    
-    # RenderUpdate
-    def on_update(self, current_time: float, delta_time: float):
-        pass
 
     # FixedUpdate
     def _on_physics_step(self, delta_time:float):
@@ -83,7 +86,7 @@ class HydrodynamicsBehavior(BehaviorScript):
         
         self._rigid_prim = RigidPrim(str(self.prim_path))
 
-        self._hydro_calculator = Hydrodynamics(
+        self._hydro_calculator = WarpHydrodynamicsWrapper(
             width=self._get_exposed_variable("xDimension"), 
             depth=self._get_exposed_variable("yDimension"), 
             height=self._get_exposed_variable("zDimension"),
@@ -95,15 +98,17 @@ class HydrodynamicsBehavior(BehaviorScript):
             gravity=self._get_exposed_variable("gravity"),
             linear_mass_coeff = self._get_exposed_variable("linearAddedMassCoefficient"),
             angular_mass_coeff = self._get_exposed_variable("angularAddedMassCoefficient"),
-            lift_coefficient=self._get_exposed_variable("liftCoefficient")
+            lift_coefficient=self._get_exposed_variable("liftCoefficient"),
+            device="cuda:0"
         )
-        carb.log_info(f"HydrodynamicsBehavior initialized for {self.prim_path}")
+
+        # Fetch mass to avoid explosions
+        self._mass = self._rigid_prim.get_masses()[0]
+        carb.log_info(f"HydrodynamicsBehavior (Warp GPU) initialized for {self.prim_path}")
 
     def _apply_behavior(self, delta_time):
-        # Get current state from the simulator
+        # Get CPU State (Update to View Tensors for RL environment)
         positions, orientations = self._rigid_prim.get_world_poses()
-        position = positions[0]
-        orientation_quat = orientations[0]
         linear_velocity = self._rigid_prim.get_linear_velocities()[0]
         angular_velocity = self._rigid_prim.get_angular_velocities()[0]
 
@@ -111,32 +116,64 @@ class HydrodynamicsBehavior(BehaviorScript):
         linear_acceleration = (linear_velocity - self._last_linear_velocity) / delta_time
         angular_acceleration = (angular_velocity - self._last_angular_velocity) / delta_time
         
-        # Get hydrodynamic forces, torques. and centers of pressure
-        (buoyancy_force, drag_force, lift_force, 
-         drag_torque, added_mass_force, added_mass_torque, 
-         center_of_buoyancy, center_of_pressure, submersion_ratio) = self._hydro_calculator.calculate_hydrodynamic_forces(
-            position=position,
-            orientation_quat= np.array([orientation_quat[1], orientation_quat[2], orientation_quat[3], orientation_quat[0]]),
-            linear_vel=linear_velocity,
-            angular_vel=angular_velocity,
-            linear_accel=linear_acceleration,
-            angular_accel=angular_acceleration
+        # Prepare Numpy inputs
+        np_pos = positions
+        np_orientation = np.array([[orientations[0][1], orientations[0][2], orientations[0][3], orientations[0][0]]], dtype=np.float32)
+        np_lin_vel = np.array([linear_velocity], dtype=np.float32)
+        np_ang_vel = np.array([angular_velocity], dtype=np.float32)
+        np_lin_acc = np.array([linear_acceleration], dtype=np.float32)
+        np_ang_acc = np.array([angular_acceleration], dtype=np.float32)
+        """
+        wp_position = wp.from_numpy(positions, dtype=wp.vec3, device="cuda:0")
+        orientation_quat = np.array([[orientations[0][1], orientations[0][2], orientations[0][3], orientations[0][0]]], dtype=np.float32)
+        wp_orientation = wp.from_numpy(orientation_quat, dtype=wp.quat, device="cuda:0")
+        wp_linear_velocity = wp.from_numpy(np.array([linear_velocity]), dtype=wp.vec3, device="cuda:0")
+        wp_angular_velocity = wp.from_numpy(np.array([angular_velocity]), dtype=wp.vec3, device="cuda:0")
+        wp_linear_acceleration = wp.from_numpy(np.array([linear_acceleration]), dtype=wp.vec3, device="cuda:0")
+        wp_angular_acceleration = wp.from_numpy(np.array([angular_acceleration]), dtype=wp.vec3, device="cuda:0")
+        """
+
+        # Run GPU Kernel 
+        (wp_buoyancy_force, wp_drag_force, wp_lift_force, wp_drag_torque, wp_added_mass_force, 
+         wp_added_mass_torque, wp_center_of_buoyancy, wp_center_of_pressure) = self._hydro_calculator.calculate_hydrodynamic_forces(
+            np_pos, np_orientation, np_lin_vel, np_ang_vel, 
+            np_lin_acc, np_ang_acc
         )
 
-        # Calculate torques generated by off-center forces
-        # Assuming the prim's origin is its center of mass
-        torque_from_buoyancy = np.cross(center_of_buoyancy - position, buoyancy_force)
-        torque_from_drag = np.cross(center_of_pressure - position, drag_force)
-        torque_from_lift = np.cross(center_of_pressure - position, lift_force)
+        # Readback Results 
+        np_buoyancy_force = wp_buoyancy_force.numpy()[0]
+        np_drag_force = wp_drag_force.numpy()[0]
+        np_lift_force = wp_lift_force.numpy()[0]
+        np_added_mass_force = wp_added_mass_force.numpy()[0]
+        np_drag_torque = wp_drag_torque.numpy()[0]
+        np_added_mass_torque = wp_added_mass_torque.numpy()[0]
+        np_center_of_buoyancy = wp_center_of_buoyancy.numpy()[0]
+        np_center_of_pressure = wp_center_of_pressure.numpy()[0]
 
-        # Sum forces and torques to get net values
-        net_force = buoyancy_force + drag_force + lift_force + added_mass_force
-        net_torque = torque_from_buoyancy + torque_from_drag + drag_torque + torque_from_lift + added_mass_torque
+        # Calculate torques generated by off-center forces
+        np_position = positions[0]
+        torque_from_buoyancy = np.cross(np_center_of_buoyancy - np_position, np_buoyancy_force)
+        torque_from_drag = np.cross(np_center_of_pressure - np_position, np_drag_force)
+        torque_from_lift = np.cross(np_center_of_pressure - np_position, np_lift_force)
+
+        # Calculate final force ad torque
+        net_force = np_buoyancy_force + np_drag_force + np_lift_force + np_added_mass_force
+        net_torque = torque_from_buoyancy + torque_from_drag + torque_from_lift + np_drag_torque + np_added_mass_torque
+
+        # Safety Clamp (Prevent Explosions)
+        MAX_ACCEL = 500.0 
+        max_force = self._mass * MAX_ACCEL
+        force_mag = np.linalg.norm(net_force)
+        if force_mag > max_force:
+            scale = max_force / force_mag
+            net_force *= scale
+            net_torque *= scale
         
-        # Apply the calculated forces and torques
+        # Apply to Simulation
         self._rigid_prim.apply_forces_and_torques_at_pos(
             forces=np.expand_dims(net_force, axis=0),
             torques=np.expand_dims(net_torque, axis=0),
+            positions=np.expand_dims(np_position, axis=0),
             is_global=True,
             indices=np.array([0])
         )

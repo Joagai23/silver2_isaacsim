@@ -1,7 +1,7 @@
 import numpy as np
 from .numba_hydrodynamics import solve_hydrodynamics
 
-class Hydrodynamics:
+class NumbaHydrodynamicsWrapper:
     """
     A lightweight wrapper that stores physical constants and calls the 
     Numba-optimized static function for calculation.

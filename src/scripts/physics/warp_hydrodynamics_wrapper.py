@@ -1,5 +1,5 @@
 import warp as wp
-import numpy as np
+import torch
 from .warp_hydrodynamics import solve_hydrodynamics_kernel
 
 class WarpHydrodynamicsWrapper:
@@ -26,7 +26,7 @@ class WarpHydrodynamicsWrapper:
         x, y, z = width/2.0, depth/2.0, height/2.0
         
         # Keypoints
-        np_keypoints = np.array([
+        keypoints = [
             [-x, y, z], [0, y, z], [x, y, z],
             [-x, 0, z], [0, 0, z], [x, 0, z],
             [-x, -y, z], [0, -y, z], [x, -y, z],
@@ -36,24 +36,24 @@ class WarpHydrodynamicsWrapper:
             [-x, y, -z], [0, y, -z], [x, y, -z],
             [-x, 0, -z], [0, 0, -z], [x, 0, -z],
             [-x, -y, -z], [0, -y, -z], [x, -y, -z]
-        ], dtype=np.float32)
+        ]
         
         # Faces
-        np_face_areas = np.array([depth*height, depth*height, width*height, width*height, width*depth, width*depth], dtype=np.float32)
-        np_local_face_normals = np.array([[1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1]], dtype=np.float32)
-        np_local_face_centers = np.array([[x,0,0], [-x,0,0], [0,y,0], [0,-y,0], [0,0,z], [0,0,-z]], dtype=np.float32)
+        face_areas = [depth*height, depth*height, width*height, width*height, width*depth, width*depth]
+        local_face_normals = [[1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1]]
+        local_face_centers = [[x,0,0], [-x,0,0], [0,y,0], [0,-y,0], [0,0,z], [0,0,-z]]
         
         # GPU Allocations
-        self.wp_keypoints = wp.from_numpy(np_keypoints, dtype=wp.vec3, device=device)
-        self.wp_areas = wp.from_numpy(np_face_areas, dtype=float, device=device)
-        self.wp_normals = wp.from_numpy(np_local_face_normals, dtype=wp.vec3, device=device)
-        self.wp_centers = wp.from_numpy(np_local_face_centers, dtype=wp.vec3, device=device)
+        self.wp_keypoints = wp.array(keypoints, dtype=wp.vec3, device=device)
+        self.wp_areas = wp.array(face_areas, dtype=float, device=device)
+        self.wp_normals = wp.array(local_face_normals, dtype=wp.vec3, device=device)
+        self.wp_centers = wp.array(local_face_centers, dtype=wp.vec3, device=device)
         
         # Parameters Vector
         volume = width * depth * height
         params_list = [water_density, gravity, linear_drag_coefficient, angular_drag_coefficient, 
                        linear_damping, angular_damping, lift_coefficient, volume]
-        self.wp_params = wp.from_numpy(np.array(params_list, dtype=np.float32), dtype=float, device=device)
+        self.wp_params = wp.array(params_list, dtype=float, device=device)
         
         # Added Mass
         added_mass_linear_value = volume * linear_mass_coeff * water_density
@@ -62,8 +62,9 @@ class WarpHydrodynamicsWrapper:
         added_mass_angular_value_y = volume * (width**2 + height**2) * angular_mass_coeff * water_density
         added_mass_angular_value_z = volume * (width**2 + depth**2) * angular_mass_coeff * water_density
         added_mass_angular_vector = [added_mass_angular_value_x, added_mass_angular_value_y, added_mass_angular_value_z]
-        np_added_mass = np.array([added_mass_linear_vector, added_mass_angular_vector], dtype=np.float32)
-        self.wp_added_mass = wp.from_numpy(np_added_mass, dtype=wp.vec3, device=device)
+
+        added_mass = [added_mass_linear_vector, added_mass_angular_vector]
+        self.wp_added_mass = wp.array(added_mass, dtype=wp.vec3, device=device)
         
         # Output Buffers
         self.out_buoyancy_force = wp.zeros(1, dtype=wp.vec3, device=device)
@@ -75,20 +76,26 @@ class WarpHydrodynamicsWrapper:
         self.out_center_of_buoyancy = wp.zeros(1, dtype=wp.vec3, device=device)
         self.out_center_of_pressure = wp.zeros(1, dtype=wp.vec3, device=device)
 
-    def calculate_hydrodynamic_forces(self, np_position, np_orientation, np_linear_velocity, 
-                                      np_angular_velocity, np_linear_acceleration, np_angular_acceleration):
+    def calculate_hydrodynamic_forces(self, t_position, t_orientation, t_linear_velocity, 
+                                      t_angular_velocity, t_linear_acceleration, t_angular_acceleration):
         """
-        Runs the Warp kernel. 
-        Inputs MUST be Warp Arrays already on the GPU.
-        Returns a tuple of Warp Arrays.
+        Takes PyTorch tensors, wraps them zero-copy, feeds to CUDA Graph, returns PyTorch tensors.
         """
+        # Wrap Torch Tensors
+        w_position = wp.from_torch(t_position, dtype=wp.vec3)
+        w_orientation = wp.from_torch(t_orientation, dtype=wp.quat) 
+        w_linear_velocity = wp.from_torch(t_linear_velocity, dtype=wp.vec3)
+        w_angular_velocity = wp.from_torch(t_angular_velocity, dtype=wp.vec3)
+        w_linear_acceleration = wp.from_torch(t_linear_acceleration, dtype=wp.vec3)
+        w_angular_acceleration = wp.from_torch(t_angular_acceleration, dtype=wp.vec3)
+
         # Assign values from allocated memory
-        self.in_position.assign(np_position)
-        self.in_orientation.assign(np_orientation)
-        self.in_lin_vel.assign(np_linear_velocity)
-        self.in_ang_vel.assign(np_angular_velocity)
-        self.in_lin_acc.assign(np_linear_acceleration)
-        self.in_ang_acc.assign(np_angular_acceleration)
+        self.in_position.assign(w_position)
+        self.in_orientation.assign(w_orientation)
+        self.in_lin_vel.assign(w_linear_velocity)
+        self.in_ang_vel.assign(w_angular_velocity)
+        self.in_lin_acc.assign(w_linear_acceleration)
+        self.in_ang_acc.assign(w_angular_acceleration)
 
         # Use CUDA graphs
         if self.graph is None:
@@ -112,6 +119,14 @@ class WarpHydrodynamicsWrapper:
         else:
             wp.capture_launch(self.graph)
         
-        # Return GPU pointers directly
-        return (self.out_buoyancy_force, self.out_drag_force, self.out_lift_force, self.out_drag_torque, 
-                self.out_added_mass_force, self.out_added_mass_torque, self.out_center_of_buoyancy, self.out_center_of_pressure)
+        # Return GPU pointers as Torch Tensors
+        return (
+            wp.to_torch(self.out_buoyancy_force),
+            wp.to_torch(self.out_drag_force),
+            wp.to_torch(self.out_lift_force),
+            wp.to_torch(self.out_drag_torque), 
+            wp.to_torch(self.out_added_mass_force),
+            wp.to_torch(self.out_added_mass_torque),
+            wp.to_torch(self.out_center_of_buoyancy),
+            wp.to_torch(self.out_center_of_pressure)
+        )

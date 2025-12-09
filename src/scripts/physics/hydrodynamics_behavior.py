@@ -1,8 +1,10 @@
 import carb
 import omni.kit.window.property
-import numpy as np
+import torch
 import omni.physx
 import warp as wp
+import json
+import os
 from isaacsim.replicator.behavior.global_variables import EXPOSED_ATTR_NS
 from isaacsim.replicator.behavior.utils.behavior_utils import (
     check_if_exposed_variables_should_be_removed,
@@ -12,13 +14,14 @@ from isaacsim.replicator.behavior.utils.behavior_utils import (
 )
 from omni.kit.scripting import BehaviorScript
 from pxr import Sdf, UsdPhysics
-from isaacsim.core.prims import RigidPrim
+from omni.isaac.core.prims import RigidPrimView
+from omni.isaac.core.simulation_context import SimulationContext
 from .warp_hydrodynamics_wrapper import WarpHydrodynamicsWrapper
 
 class HydrodynamicsBehavior(BehaviorScript):
     """
-    Behavior script that applies buoyancy, drag, lift, and added mass forces to a rigid body.
-    Hydrodynamics are modeled based on a cube with uniformed material density.
+    Behavior script that applies hydrodynamics using a Zero-Copy GPU Pipeline.
+    Data flow: Isaac Sim (GPU) -> PyTorch (GPU) -> Warp (GPU) -> Isaac Sim (GPU).
     """
     BEHAVIOR_NS = "hydrodynamicsBehavior"
 
@@ -43,21 +46,79 @@ class HydrodynamicsBehavior(BehaviorScript):
     ]
 
     def on_init(self):
+        # Initialize Simulation Context with Torch Backend
+        self._device = "cuda:0"
+        self._sim_context = SimulationContext(backend="torch", device=self._device)
+
+        # Initialize class variables
         self._hydro_calculator = None
-        self._rigid_prim = None
-        self._last_linear_velocity = np.zeros(3, dtype=np.float64)
-        self._last_angular_velocity = np.zeros(3, dtype=np.float64)
+        self._rigid_prim_view = None
+        self._last_linear_velocity = None
+        self._last_angular_velocity = None
         
         # Physics-based update
         self._physx_subscription = None
         # Initialize Warp Global
         try:
-            wp.init()
+            if not wp.is_mempool_enabled(device=self._device):
+                wp.init()
         except Exception as e:
             carb.log_error(f"Failed to initialize NVIDIA Warp: {e}")
 
         create_exposed_variables(self.prim, EXPOSED_ATTR_NS, self.BEHAVIOR_NS, self.VARIABLES_TO_EXPOSE)
+        self._apply_json_config()
         omni.kit.window.property.get_window().request_rebuild()
+
+    def _apply_json_config(self):
+        """
+        Loads config and matches Prim name (e.g. 'Coxa_0') to JSON category (e.g. 'coxa').
+        """
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(current_dir, "hydrodynamics_config.json")
+
+        if not os.path.exists(config_path):
+            carb.log_warn(f"[Hydro] Config missing at {config_path}")
+            return
+
+        try:
+            with open(config_path, 'r') as f:
+                data = json.load(f)
+            
+            if "globals" in data:
+                for k, v in data["globals"].items():
+                    self._set_attr(k, v)
+
+            prim_name = self.prim.GetName().lower()
+            part_type = None
+            
+            if "parts" in data:
+                for category in data["parts"].keys():
+                    if category.lower() in prim_name:
+                        part_type = category
+                        break
+            
+            if part_type is None and "body" in prim_name:
+                 part_type = "body"
+
+            if part_type:
+                carb.log_info(f"[Hydro] Config: Applied '{part_type}' settings to {self.prim.GetName()}")
+                part_data = data["parts"][part_type]
+                for k, v in part_data.items():
+                    self._set_attr(k, v)
+            else:
+                carb.log_warn(f"[Hydro] Config: No matching part found for {self.prim.GetName()}. Using defaults.")
+
+        except Exception as e:
+            carb.log_error(f"[Hydro] JSON Error: {e}")
+    
+    def _set_attr(self, name, value):
+        full_attr_name = f"{EXPOSED_ATTR_NS}:{self.BEHAVIOR_NS}:{name}"
+        attr = self.prim.GetAttribute(full_attr_name)
+        
+        if attr and attr.IsValid():
+            attr.Set(float(value))
+        else:
+            carb.log_warn(f"[Hydro] Failed to set attribute: {full_attr_name}")
 
     def on_destroy(self):
         self._reset()
@@ -75,7 +136,7 @@ class HydrodynamicsBehavior(BehaviorScript):
 
     # FixedUpdate
     def _on_physics_step(self, delta_time:float):
-        if delta_time <= 1e-6 or self._rigid_prim is None:
+        if delta_time <= 1e-6 or self._rigid_prim_view is None or not self._rigid_prim_view.is_valid():
             return
         self._apply_behavior(delta_time)
 
@@ -84,7 +145,12 @@ class HydrodynamicsBehavior(BehaviorScript):
             carb.log_warn(f"HydrodynamicsBehavior on prim {self.prim_path} requires a RigidBody component.")
             return
         
-        self._rigid_prim = RigidPrim(str(self.prim_path))
+        view_name = f"hydro_view_{self.prim_path.name}"
+        self._rigid_prim_view = RigidPrimView(
+            prim_paths_expr=str(self.prim_path),
+            name=view_name
+        )
+        self._rigid_prim_view.initialize()
 
         self._hydro_calculator = WarpHydrodynamicsWrapper(
             width=self._get_exposed_variable("xDimension"), 
@@ -99,94 +165,83 @@ class HydrodynamicsBehavior(BehaviorScript):
             linear_mass_coeff = self._get_exposed_variable("linearAddedMassCoefficient"),
             angular_mass_coeff = self._get_exposed_variable("angularAddedMassCoefficient"),
             lift_coefficient=self._get_exposed_variable("liftCoefficient"),
-            device="cuda:0"
+            device=self._device
         )
 
         # Fetch mass to avoid explosions
-        self._mass = self._rigid_prim.get_masses()[0]
+        masses = self._rigid_prim_view.get_masses(clone=False)
+        self._mass = masses[0]
         carb.log_info(f"HydrodynamicsBehavior (Warp GPU) initialized for {self.prim_path}")
 
     def _apply_behavior(self, delta_time):
-        # Get CPU State (Update to View Tensors for RL environment)
-        positions, orientations = self._rigid_prim.get_world_poses()
-        linear_velocity = self._rigid_prim.get_linear_velocities()[0]
-        angular_velocity = self._rigid_prim.get_angular_velocities()[0]
+        try:
+            positions, orientations = self._rigid_prim_view.get_world_poses(clone=False)
+            full_velocities = self._rigid_prim_view.get_velocities(clone=False)
+            
+            if full_velocities is None or full_velocities.shape[0] == 0:
+                return
+
+            positions = positions.to(self._device)
+            orientations = orientations.to(self._device)
+            full_velocities = full_velocities.to(self._device)
+            
+            linear_velocity = full_velocities[:, 0:3]
+            angular_velocity = full_velocities[:, 3:6]
+            
+        except (UnboundLocalError, IndexError, RuntimeError, AttributeError):
+            return
+
+        orientation = orientations[:, [1, 2, 3, 0]]
+
+        if self._last_linear_velocity is None:
+            self._last_linear_velocity = torch.zeros_like(linear_velocity, device=self._device)
+            self._last_angular_velocity = torch.zeros_like(angular_velocity, device=self._device)
 
         # Estimate acceleration
         linear_acceleration = (linear_velocity - self._last_linear_velocity) / delta_time
         angular_acceleration = (angular_velocity - self._last_angular_velocity) / delta_time
-        
-        # Prepare Numpy inputs
-        np_pos = positions
-        np_orientation = np.array([[orientations[0][1], orientations[0][2], orientations[0][3], orientations[0][0]]], dtype=np.float32)
-        np_lin_vel = np.array([linear_velocity], dtype=np.float32)
-        np_ang_vel = np.array([angular_velocity], dtype=np.float32)
-        np_lin_acc = np.array([linear_acceleration], dtype=np.float32)
-        np_ang_acc = np.array([angular_acceleration], dtype=np.float32)
-        """
-        wp_position = wp.from_numpy(positions, dtype=wp.vec3, device="cuda:0")
-        orientation_quat = np.array([[orientations[0][1], orientations[0][2], orientations[0][3], orientations[0][0]]], dtype=np.float32)
-        wp_orientation = wp.from_numpy(orientation_quat, dtype=wp.quat, device="cuda:0")
-        wp_linear_velocity = wp.from_numpy(np.array([linear_velocity]), dtype=wp.vec3, device="cuda:0")
-        wp_angular_velocity = wp.from_numpy(np.array([angular_velocity]), dtype=wp.vec3, device="cuda:0")
-        wp_linear_acceleration = wp.from_numpy(np.array([linear_acceleration]), dtype=wp.vec3, device="cuda:0")
-        wp_angular_acceleration = wp.from_numpy(np.array([angular_acceleration]), dtype=wp.vec3, device="cuda:0")
-        """
 
         # Run GPU Kernel 
-        (wp_buoyancy_force, wp_drag_force, wp_lift_force, wp_drag_torque, wp_added_mass_force, 
-         wp_added_mass_torque, wp_center_of_buoyancy, wp_center_of_pressure) = self._hydro_calculator.calculate_hydrodynamic_forces(
-            np_pos, np_orientation, np_lin_vel, np_ang_vel, 
-            np_lin_acc, np_ang_acc
+        (t_buoyancy_force, t_drag_force, t_lift_force, t_drag_torque, t_added_mass_force, 
+         t_added_mass_torque, t_center_of_buoyancy, t_center_of_pressure) = self._hydro_calculator.calculate_hydrodynamic_forces(
+            positions, orientation, linear_velocity, angular_velocity, 
+            linear_acceleration, angular_acceleration
         )
 
-        # Readback Results 
-        np_buoyancy_force = wp_buoyancy_force.numpy()[0]
-        np_drag_force = wp_drag_force.numpy()[0]
-        np_lift_force = wp_lift_force.numpy()[0]
-        np_added_mass_force = wp_added_mass_force.numpy()[0]
-        np_drag_torque = wp_drag_torque.numpy()[0]
-        np_added_mass_torque = wp_added_mass_torque.numpy()[0]
-        np_center_of_buoyancy = wp_center_of_buoyancy.numpy()[0]
-        np_center_of_pressure = wp_center_of_pressure.numpy()[0]
-
         # Calculate torques generated by off-center forces
-        np_position = positions[0]
-        torque_from_buoyancy = np.cross(np_center_of_buoyancy - np_position, np_buoyancy_force)
-        torque_from_drag = np.cross(np_center_of_pressure - np_position, np_drag_force)
-        torque_from_lift = np.cross(np_center_of_pressure - np_position, np_lift_force)
+        t_torque_buoyancy = torch.cross(t_center_of_buoyancy - positions, t_buoyancy_force, dim=-1)
+        t_torque_drag = torch.cross(t_center_of_pressure - positions, t_drag_force, dim=-1)
+        t_torque_lift = torch.cross(t_center_of_pressure - positions, t_lift_force, dim=-1)
 
         # Calculate final force ad torque
-        net_force = np_buoyancy_force + np_drag_force + np_lift_force + np_added_mass_force
-        net_torque = torque_from_buoyancy + torque_from_drag + torque_from_lift + np_drag_torque + np_added_mass_torque
+        net_force = t_buoyancy_force + t_drag_force + t_lift_force + t_added_mass_force
+        net_torque = t_torque_buoyancy + t_torque_drag + t_torque_lift + t_drag_torque + t_added_mass_torque
 
         # Safety Clamp (Prevent Explosions)
         MAX_ACCEL = 500.0 
         max_force = self._mass * MAX_ACCEL
-        force_mag = np.linalg.norm(net_force)
-        if force_mag > max_force:
-            scale = max_force / force_mag
-            net_force *= scale
-            net_torque *= scale
+        force_mag = torch.norm(net_force, dim=-1, keepdim=True)
+        scale = torch.clamp(max_force / (force_mag + 1e-6), max=1.0)
+        net_force = net_force * scale
+        net_torque = net_torque * scale
         
         # Apply to Simulation
-        self._rigid_prim.apply_forces_and_torques_at_pos(
-            forces=np.expand_dims(net_force, axis=0),
-            torques=np.expand_dims(net_torque, axis=0),
-            positions=np.expand_dims(np_position, axis=0),
-            is_global=True,
-            indices=np.array([0])
+        self._rigid_prim_view.apply_forces_and_torques_at_pos(
+            forces=net_force,
+            torques=net_torque,
+            positions=positions,
+            is_global=True
         )
 
         # Update stored velocities for the next frame
-        self._last_linear_velocity = linear_velocity
-        self._last_angular_velocity = angular_velocity
+        self._last_linear_velocity = linear_velocity.clone()
+        self._last_angular_velocity = angular_velocity.clone()
 
     def _reset(self):
         self._hydro_calculator = None
-        self._rigid_prim = None
-        self._last_linear_velocity = np.zeros(3, dtype=np.float64)
-        self._last_angular_velocity = np.zeros(3, dtype=np.float64)
+        self._rigid_prim_view = None
+        self._last_linear_velocity = None
+        self._last_angular_velocity = None
         self._physx_subscription = None
 
     def _get_exposed_variable(self, attr_name):

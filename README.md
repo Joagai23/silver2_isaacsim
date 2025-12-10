@@ -88,7 +88,21 @@ A panoramic view of the robot walking through the digital twin of the OBSEA obse
     `src/scenes/silver2_isaac_sim.usd`
 4.  Press the **PLAY** button. 
     * Note: The `HydrodynamicsBehavior` script will initialize, and the robot will settle on the seabed.
-5.  Locomotion controls can be accessed via the standard ROS bridge or the provided python interface.
+5.  Load locomotion bridge between the simulation and ROS2
+    ```bash
+    # Navigate to the main directory
+    cd ~/PathToWorkspace/silver2_isaacsim
+
+    # Source the ROS2 environment
+    source /opt/ros/jazzy/setup.bash
+    
+    # Activate the virtual environment 
+    source venv/bin/activate
+
+    # Run the locomotion controller script
+    python3 ./src/scripts/robotics/cmd_vel_control_rotation.py
+    ```
+6.  Locomotion controls can be accessed via the standard ROS bridge or the provided python interface.
     * Keyboard Teleoperation
         ```bash
         # Source the ROS 2 environment

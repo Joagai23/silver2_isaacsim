@@ -11,7 +11,7 @@ from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import Twist
-import robot
+import scripts.robotics.robot as robot
 
 should_quit = False
 

@@ -5,7 +5,7 @@
 from __future__ import division
 import numpy as np
 
-from robot_def import *	# Constant definitions
+from scripts.robotics.robot_def import *	# Constant definitions
 import time
 import math
 from scipy.spatial import Delaunay

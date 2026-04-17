@@ -27,8 +27,11 @@ class Client():
             elif choice == '2':
                 self.__show_system_status()
                 print("\n-> Displaying current internal state.")
-                
+
             elif choice == '3':
+                self.__static_pose_control()
+                
+            elif choice == '4':
                 print("\n-> Exiting the application.")
                 break
                 
@@ -39,7 +42,8 @@ class Client():
         print("\n--- Loco-Manipulator Controller ---")
         print("1. Move Leg")
         print("2. Read Joints")
-        print("3. Exit")
+        print("3. Static Poses")
+        print("4. Exit")
 
     def __print_silver2_schema(self):
         print("""
@@ -92,19 +96,57 @@ class Client():
                 print(f"  -> Error: To protect the robot, angle must be between {min_angle}° and {max_angle}°.") 
 
     def __show_system_status(self):
-        print("--- System Status: Joint Positions ---")
-        leg_status = self.__ros_controller.get_Q_current_degrees()
+        print("--- System Status: Joint Positions (Sim vs Real) ---")
+        print("                 [ SIMULATION ]                   |                 [ HARDWARE ]")
+        
+        # Unpack the two arrays
+        sim_status, real_status = self.__ros_controller.get_Q_current_degrees()
+        
         for leg_id in range(6):
-            # Calculate the starting index for this leg's joints
             idx = leg_id * 3 
             
-            # Extract the angles from the flat array
-            coxa = leg_status[idx]
-            femur = leg_status[idx + 1]
-            tibia = leg_status[idx + 2]
+            # Extract Sim Angles
+            s_coxa = sim_status[idx]
+            s_femur = sim_status[idx + 1]
+            s_tibia = sim_status[idx + 2]
             
-            # Print a cleanly aligned log line. 
-            # The :>5.1f formats the number to 1 decimal place and aligns it.
-            print(f"Leg {leg_id} -> Coxa: {coxa:>5.1f}° | Femur: {femur:>5.1f}° | Tibia: {tibia:>5.1f}°")
+            # Extract Real Angles
+            r_coxa = real_status[idx]
+            r_femur = real_status[idx + 1]
+            r_tibia = real_status[idx + 2]
+            
+            # Format the strings
+            sim_str = f"Leg {leg_id} -> Coxa: {s_coxa:>5.1f}° | Femur: {s_femur:>5.1f}° | Tibia: {s_tibia:>5.1f}°"
+            real_str = f"Coxa: {r_coxa:>5.1f}° | Femur: {r_femur:>5.1f}° | Tibia: {r_tibia:>5.1f}°"
+            
+            # Print side-by-side with a separator
+            print(f"{sim_str}   |   {real_str}")
         
-        print("-" * 38)
+        print("-" * 96)
+
+    def __static_pose_control(self):
+        print("--- Static Pose Selection ---\n")
+        print("A. Zero Pose (All joints at 0°)")
+        print("B. Low Torque (Resting position)")
+        print("C. Dragon Pose (Ready stance)")
+        print("X. Cancel and return to menu")
+        
+        pose_choice = input("\nSelect a pose (A/B/C) or X to cancel: ").upper()
+        
+        if pose_choice == 'A':
+            print("\n-> SUCCESS: Sending 'Zero' pose command...")
+            self.__ros_controller.trigger_static_pose("zero")
+            
+        elif pose_choice == 'B':
+            print("\n-> SUCCESS: Sending 'Low Torque' pose command...")
+            self.__ros_controller.trigger_static_pose("low_torque")
+            
+        elif pose_choice == 'C':
+            print("\n-> SUCCESS: Sending 'Dragon' pose command...")
+            self.__ros_controller.trigger_static_pose("dragon")
+            
+        elif pose_choice == 'X':
+            print("\n-> Action canceled.")
+            
+        else:
+            print("\n-> Error: Invalid selection. Please enter A, B, C, or X.")

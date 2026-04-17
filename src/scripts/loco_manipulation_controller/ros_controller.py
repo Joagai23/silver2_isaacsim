@@ -1,15 +1,12 @@
-import subprocess
-import os
+import time
 import numpy as np
 import numpy.typing as npt
-import sys, time, signal
-import numpy as np
 
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
 from sensor_msgs.msg import JointState
-from geometry_msgs.msg import Twist
+# from geometry_msgs.msg import Twist
 
 class RosController(Node):
 
@@ -17,41 +14,16 @@ class RosController(Node):
         super().__init__('ros_controller_node')
         self.__define_ros_variables()
         self.__define_ros_topics()
-        self.__define_joint_limits()
-
-    def __source_ros_environment(self, setup_path="/opt/ros/jazzy/setup.bash"):
-        print(f"Attempting to source {setup_path}...")
-
-        command = f"source {setup_path} && env"  
-        result = subprocess.run(
-            ['bash', '-c', command], 
-            capture_output=True, 
-            text=True
-        )
-        
-        if result.returncode != 0:
-            print("Error: Could not source the file. Check the path.")
-            return False
-            
-        for line in result.stdout.splitlines():
-            if '=' in line:
-                key, value = line.split('=', 1)
-                os.environ[key] = value
-
-                if key == "PYTHONPATH":
-                    for path in value.split(':'):
-                        if path not in sys.path:
-                            sys.path.append(path)
-                
-        print("Success! ROS environment variables are now loaded in Python.")
-        return True
+        self.__define_joint_constants()
     
     def __define_ros_topics(self):
         print("Creating ROS subscriptions and publishers...")
         try:
-            self.joint_state_subscriber = self.create_subscription(JointState, '/joint_states', self.joint_state_subscriber_callback, 10)
-            #self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
-            self.pid_pos_publisher = self.create_publisher(JointState, '/joint_command', 10) 
+            self.__sim_joint_state_subscriber = self.create_subscription(JointState, '/joint_states_sim', self.__sim_joint_state_subscriber_callback, 10)
+            self.__real_joint_state_subscriber = self.create_subscription(JointState, '/joint_states', self.__real_joint_state_subscriber_callback, 10)
+            self.__sim_publisher = self.create_publisher(JointState, '/joint_command', 10)
+            self.__real_publisher = self.create_publisher(Float64MultiArray, '/pid_position_controller/commands', 10)
+
             self.get_logger().info("ROS topics initialized successfully.")
 
         except Exception as e:
@@ -59,7 +31,8 @@ class RosController(Node):
             raise e
 
     def __define_ros_variables(self):
-        self.__Q_current = np.zeros(18)
+        self.__Q_current_sim = np.zeros(18)
+        self.__Q_current_real = np.zeros(18)
         self.joint_order = [
             'coxa_joint_0', 'femur_joint_0', 'tibia_joint_0',
             'coxa_joint_1', 'femur_joint_1', 'tibia_joint_1',
@@ -70,39 +43,60 @@ class RosController(Node):
         ]
 
     def get_Q_current_degrees(self):
-        return np.degrees(self.__Q_current)
+        return np.degrees(self.__Q_current_sim), np.degrees(self.__Q_current_real)
 
-    def joint_state_subscriber_callback(self, msg):
+    def __sim_joint_state_subscriber_callback(self, msg):
         # Convert from isaac format
         isaac_pos = [a*b for a,b in zip(self.FROM_ISAAC, msg.position)]
         joint_position_dict = dict(zip(msg.name, isaac_pos))
         # Save current joint state
         for i, joint_name in enumerate(self.joint_order):
             if joint_name in joint_position_dict:
-                self.__Q_current[i] = joint_position_dict[joint_name]
+                self.__Q_current_sim[i] = joint_position_dict[joint_name]
+            else:
+                self.get_logger().warn(f"Joint {joint_name} not found in message")
+    
+    def __real_joint_state_subscriber_callback(self, msg):
+        joint_position_dict = dict(zip(msg.name, msg.position))
+        for i, joint_name in enumerate(self.joint_order):
+            if joint_name in joint_position_dict:
+                self.__Q_current_real[i] = joint_position_dict[joint_name]
             else:
                 self.get_logger().warn(f"Joint {joint_name} not found in message")
 
-    def __define_joint_limits(self):
+    def __define_joint_constants(self):
         self.COXA_MIN, self.COXA_MAX = -90, 90
         self.FEMUR_MIN, self.FEMUR_MAX = -90, 90
         self.TIBIA_MIN, self.TIBIA_MAX = -180, 180
         self.FROM_ISAAC = np.array([-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1, 1,1,1,1,1,1])
         self.TO_ISAAC = np.array([-1,-1,1, -1,-1,1, -1,-1,1, -1,-1,1, -1,-1,1, -1,-1,1])
+        self.LOW_TORQUE_POSE = np.array([45,-75,0, 0,-75,0, -45,-75,0, -45,-75,0, 0,-75,0, 45,-75,0])
+        self.DRAGON_POSE = np.array([45,75,130,0,75,130,-45,75,130,-45,75,130,0,75,130,45,75,130])
 
     def move_leg_command(self, leg_index:int, joint_values:npt.ArrayLike):
-        joint_array = np.copy(self.__Q_current)
+        joint_array = np.copy(self.__Q_current_sim)
         start = leg_index * 3
         joint_array[start : start + 3] = np.radians(joint_values)
-        
 
         self.__go_to_pose(joint_array)
+
+    def trigger_static_pose(self, pose_choice:str):
+        # Define Pose 'Zero' by default
+        pose = np.zeros(18)
+
+        if pose_choice == 'low_torque':
+            pose = np.copy(self.LOW_TORQUE_POSE)
+
+        elif pose_choice == 'dragon':
+            pose = np.copy(self.DRAGON_POSE)
+
+        pose = np.radians(pose)
+        self.__go_to_pose(pose)
 
     def __go_to_pose(self, joint_pose:npt.ArrayLike):
         self.get_logger().info("Initializing: Moving to Pose safely in joint space...")
 
-
-        Q_start = np.copy(self.__Q_current)
+        Q_start = np.copy(self.__Q_current_sim)
         Q_end = joint_pose
 
         steps = 60
@@ -124,16 +118,20 @@ class RosController(Node):
                 f"The number of joint names ({len(self.joint_order)}) does not match "
                 f"the number of received positions ({len(pos_array)})."
             )
+            return
+        
+        # --- 1. REAL HARDWARE PACKAGING
+        hardware_msg = Float64MultiArray()
+        hardware_msg.data = [float(val) for val in pos_array]
+        self.__real_publisher.publish(hardware_msg)
             
-        # Create and populate Joint State
+        # --- 2. ISAAC SIM PACKAGING
         joint_state_msg = JointState()
         joint_state_msg.name = self.joint_order
-        # Convert to isaac format
-        isaac_pos = [a*b for a,b in zip(self.TO_ISAAC, pos_array)]
+        isaac_pos = [float(a*b) for a,b in zip(self.TO_ISAAC, pos_array)]
         joint_state_msg.position = isaac_pos
         joint_state_msg.velocity = []
         joint_state_msg.effort = []
+        self.__sim_publisher.publish(joint_state_msg)
 
-        # Publish and Wait
-        self.pid_pos_publisher.publish(joint_state_msg)
         time.sleep(timestep)

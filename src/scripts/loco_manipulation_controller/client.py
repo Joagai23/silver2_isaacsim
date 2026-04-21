@@ -48,11 +48,11 @@ class Client():
     def __print_silver2_schema(self):
         print("""
       [ FRONT ]
-   (0) \\_   _/ (3)
+   (3) \\_   _/ (0)
          | |
-   (1) --| |-- (4)
+   (4) --| |-- (1)
          | |
-   (2) /     \\ (5)
+   (5) /     \\ (2)
       [ BACK ]
         """)
 

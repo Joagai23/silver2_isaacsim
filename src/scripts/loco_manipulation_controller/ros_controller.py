@@ -68,8 +68,8 @@ class RosController(Node):
         self.COXA_MIN, self.COXA_MAX = -90, 90
         self.FEMUR_MIN, self.FEMUR_MAX = -90, 90
         self.TIBIA_MIN, self.TIBIA_MAX = -180, 180
-        self.FROM_ISAAC = np.array([-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1, 1,1,1,1,1,1])
-        self.TO_ISAAC = np.array([-1,-1,1, -1,-1,1, -1,-1,1, -1,-1,1, -1,-1,1, -1,-1,1])
+        self.FROM_ISAAC = np.array([1,1,1,1,1,1, -1,-1,-1,-1,-1,-1, 1,1,1,1,1,1])
+        self.TO_ISAAC = np.array([1,-1,1, 1,-1,1, 1,-1,1, 1,-1,1, 1,-1,1, 1,-1,1])
         self.LOW_TORQUE_POSE = np.array([45,-75,0, 0,-75,0, -45,-75,0, -45,-75,0, 0,-75,0, 45,-75,0])
         self.DRAGON_POSE = np.array([45,75,130,0,75,130,-45,75,130,-45,75,130,0,75,130,45,75,130])
 

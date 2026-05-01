@@ -12,7 +12,7 @@ import numpy as np
 import warp as wp
 
 # Full path to OCEANSIM sensors folder
-OCEANSIM_SENSORS_PATH = os.path.expanduser("~/Documents/isaac-sim/extsUser/OceanSim/isaacsim/oceansim/sensors")
+OCEANSIM_SENSORS_PATH = os.path.expanduser("~/Documents/isaac-sim-5/extsUser/OceanSim/isaacsim/oceansim/sensors")
 if OCEANSIM_SENSORS_PATH not in sys.path:
     sys.path.append(OCEANSIM_SENSORS_PATH)
     print(f"Added OceanSim sensors path: {OCEANSIM_SENSORS_PATH}")

@@ -1,7 +1,6 @@
 import carb
 from omni.kit.scripting import BehaviorScript
 import csv
-import datetime
 import os
 from pxr import UsdPhysics
 from isaacsim.core.prims import RigidPrim
@@ -9,15 +8,12 @@ from isaacsim.core.prims import RigidPrim
 class LogVelocity(BehaviorScript):
     def on_init(self):
         script_directory = os.path.dirname(__file__)
-        self._log_file_path = os.path.join(script_directory, "velocity_log.csv")
+        self._log_file_path = os.path.join(script_directory, "./drop_test/log.csv")
 
     def on_play(self):
         self._setup()
 
-        header = ['timestamp', 
-                  'z_position', 'linear_velocity_z', 'angular_velocity_z',
-                  'x_position', 'linear_velocity_x', 'angular_velocity_x',
-                  'y_position', 'linear_velocity_y', 'angular_velocity_y']
+        header = ['timestamp', 'z_position', 'linear_velocity_z']
         try:
             with open(self._log_file_path, 'w', newline='') as f:
                 writer = csv.writer(f)
@@ -33,19 +29,11 @@ class LogVelocity(BehaviorScript):
         positions, _ = self._rigid_prim.get_world_poses()
         position = positions[0]
         linear_velocity = self._rigid_prim.get_linear_velocities()
-        angular_velocity = self._rigid_prim.get_angular_velocities()
 
         log_row = [
-            datetime.datetime.now().isoformat(),
+            current_time,
             position[2],
-            linear_velocity[0][2],
-            angular_velocity[0][2],
-            position[0],
-            linear_velocity[0][0],
-            angular_velocity[0][0],
-            position[1],
-            linear_velocity[0][1],
-            angular_velocity[0][1]
+            linear_velocity[0][2]
         ]
         try:
             with open(self._log_file_path, 'a', newline='') as f:

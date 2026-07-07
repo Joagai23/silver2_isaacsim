@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Author: Giacomo Picardi (modified for cmd_vel integration)
-# Maintainer: Jorge Aguirregomezcorta Aina (modified for Isaac Sim)
+# Maintainer: Jorge Aguirregomezcorta Aina (modified for Isaac Sim & Data Logging)
 
 import sys, time, signal
 import numpy as np
+import csv
+import os
+from datetime import datetime
+import math
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
+
 from std_msgs.msg import Float64MultiArray
 from sensor_msgs.msg import JointState
-from geometry_msgs.msg import Twist
-import scripts.robotics.robot as robot
+from geometry_msgs.msg import Twist, PoseStamped
+import robot
 
 should_quit = False
 
@@ -23,6 +30,37 @@ class OmnidirectionalGaitController(Node):
 
     def __init__(self):
         super().__init__('omnidirectional_gait_controller')
+        self.set_parameters([rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)])
+        self.group = ReentrantCallbackGroup()
+
+        # Setup Data Logging Infrastructure
+        os.makedirs('data', exist_ok=True)
+        timestamp_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.filename = f"data/motion_and_effort_{timestamp_str}.csv"
+        self.csv_file = open(self.filename, mode='w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow([
+            'sec', 'nanosec', 'x', 'y', 'z', 'is_moving', 
+            'coxa_mean_effort', 'femur_mean_effort', 'tibia_mean_effort'
+        ])
+        self.get_logger().info(f"Logging motion, pose & efforts to {self.filename}")
+
+        # 20Hz Data Logging Timer
+        self.timer = self.create_timer(0.05, self.log_synced_data)
+
+        # Tracking Variables
+        self.current_x = 0.0
+        self.current_y = 0.0
+        self.current_z = 0.0
+        self.last_x = 0.0
+        self.last_y = 0.0
+        self.is_moving = False
+        self.current_sec = 0
+        self.current_nanosec = 0
+        
+        self.latest_coxa_mean = 0.0
+        self.latest_femur_mean = 0.0
+        self.latest_tibia_mean = 0.0
 
         # Fixed gait parameters
         self.gait_width = 40.0
@@ -42,8 +80,88 @@ class OmnidirectionalGaitController(Node):
 
         # Robot model and communication setup
         self.robot = robot.Robot()
+        self.Q_current = robot.static_poses_pos['zero']
 
-        self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)   
+        self.joint_order = [
+            'coxa_joint_0', 'femur_joint_0', 'tibia_joint_0',
+            'coxa_joint_1', 'femur_joint_1', 'tibia_joint_1',
+            'coxa_joint_2', 'femur_joint_2', 'tibia_joint_2',
+            'coxa_joint_3', 'femur_joint_3', 'tibia_joint_3',
+            'coxa_joint_4', 'femur_joint_4', 'tibia_joint_4',
+            'coxa_joint_5', 'femur_joint_5', 'tibia_joint_5',
+        ]
+
+        # Lenient QoS profile to aggressively match Isaac Sim bridge endpoints
+        sim_qos = rclpy.qos.QoSProfile(
+            depth=10,
+            reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+            durability=rclpy.qos.DurabilityPolicy.VOLATILE,
+            history=rclpy.qos.HistoryPolicy.KEEP_LAST
+        )
+
+        self.joint_state_subscriber = self.create_subscription(
+            JointState, '/joint_states', 
+            self.joint_state_subscriber_callback, sim_qos, 
+            callback_group=self.group)
+            
+        self.pose_subscriber = self.create_subscription(
+            PoseStamped, '/silver2/pose', 
+            self.pose_callback, sim_qos, 
+            callback_group=self.group)
+
+        self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, sim_qos)
+        self.pid_pos_publisher = self.create_publisher(JointState, '/joint_command', 10)     
+
+    def pose_callback(self, msg):
+        # Extract timestamp and global coordinates from Action Graph TransformStamped
+        self.current_sec = msg.header.stamp.sec
+        self.current_nanosec = msg.header.stamp.nanosec
+        self.current_x = msg.pose.position.x
+        self.current_y = msg.pose.position.y
+        self.current_z = msg.pose.position.z
+        
+        # Determine motion state (0.1mm displacement tolerance)
+        if math.hypot(self.current_x - self.last_x, self.current_y - self.last_y) > 0.0001:
+            self.is_moving = True
+        else:
+            self.is_moving = False
+            
+        self.last_x = self.current_x
+        self.last_y = self.current_y
+
+    def joint_state_subscriber_callback(self, msg):
+        # Convert from isaac format
+        isaac_pos = [a*b for a,b in zip(robot.static_poses_pos['from_isaac'], msg.position)]
+        joint_position_dict = dict(zip(msg.name, isaac_pos))
+        
+        # Save current joint state
+        for i, joint_name in enumerate(self.joint_order):
+            if joint_name in joint_position_dict:
+                self.Q_current[i] = joint_position_dict[joint_name]
+            else:
+                self.get_logger().warn(f"Joint {joint_name} not found in message")
+                
+        # --- Effort Mean Calculations & Logging (Synchronized via loop) ---
+        if msg.effort:
+            coxa, femur, tibia = [], [], []
+            for name, effort in zip(msg.name, msg.effort):
+                if 'coxa' in name: coxa.append(effort)
+                elif 'femur' in name: femur.append(effort)
+                elif 'tibia' in name: tibia.append(effort)
+            
+            self.latest_coxa_mean = sum(coxa) / len(coxa) if coxa else 0.0
+            self.latest_femur_mean = sum(femur) / len(femur) if femur else 0.0
+            self.latest_tibia_mean = sum(tibia) / len(tibia) if tibia else 0.0
+
+    def log_synced_data(self):
+        # The single authoritative point where data gets flushed to the CSV
+        self.csv_writer.writerow([
+            self.current_sec, self.current_nanosec,
+            self.current_x, self.current_y, self.current_z,
+            1 if self.is_moving else 0,
+            self.latest_coxa_mean, self.latest_femur_mean, self.latest_tibia_mean
+        ])
+        self.csv_file.flush()
 
     def cmd_vel_callback(self, msg):
         self.latest_cmd = msg
@@ -59,7 +177,6 @@ class OmnidirectionalGaitController(Node):
                 break
             msg = Float64MultiArray()
             msg.data = Q_cc[:, i].tolist()
-            # Change from Array to Joint State goes here
             self.publish_joint_setpoint(msg.data, ctrl_timestep)
 
     def omni_loop(self):
@@ -68,7 +185,7 @@ class OmnidirectionalGaitController(Node):
         ctrl_timestep = self.period / self.nstep
 
         while rclpy.ok() and not should_quit:
-            rclpy.spin_once(self, timeout_sec=0.1)
+            #rclpy.spin_once(self, timeout_sec=0.1)
 
             if self.latest_cmd is None:
                 time.sleep(0.1)
@@ -129,14 +246,64 @@ class OmnidirectionalGaitController(Node):
                 
             i += 1
 
+    def publish_joint_setpoint(self, pos_array, timestep):
+        if len(pos_array) != len(self.joint_order):
+            self.get_logger().error(
+                f"Failed to convert message: "
+                f"The number of joint names ({len(self.joint_order)}) does not match "
+                f"the number of received positions ({len(pos_array)})."
+            )
+
+        joint_state_msg = JointState()
+        joint_state_msg.name = self.joint_order
+        isaac_pos = [a*b for a,b in zip(robot.static_poses_pos['to_isaac'], pos_array)]
+        joint_state_msg.position = isaac_pos
+        joint_state_msg.velocity = []
+        joint_state_msg.effort = []
+
+        # Publish and Wait
+        self.pid_pos_publisher.publish(joint_state_msg)
+        
+        # Non-blocking time step execution to prevent thread starvation
+        start_time = self.get_clock().now()
+        
+        # Create a duration object for the timestep
+        duration = rclpy.duration.Duration(seconds=timestep)
+        target_time = start_time + duration
+        
+        # Sleep the thread until the simulation clock reaches the target time
+
+        while rclpy.ok() and not should_quit:
+            current_time = self.get_clock().now()
+            if current_time >= target_time:
+                break
+            time.sleep(0.001)
+
+    def destroy_node(self):
+        # Safely close your logger file descriptor upon node destruction
+        if self.csv_file:
+            self.csv_file.close()
+            self.get_logger().info("Motion & Effort CSV data logger cleanly saved/closed.")
+        super().destroy_node()
+
 if __name__ == '__main__':
     rclpy.init()
-    prevhand = signal.signal(signal.SIGINT, handler)
+    gait_controller = OmnidirectionalGaitController()
+    
+    # Use a MultiThreadedExecutor
+    executor = MultiThreadedExecutor()
+    executor.add_node(gait_controller)
+    
+    # Run the controller in a separate thread so it doesn't block callbacks
+    import threading
+    controller_thread = threading.Thread(target=gait_controller.omni_loop, daemon=True)
+    controller_thread.start()
+    
     try:
-        gait_controller = OmnidirectionalGaitController()
-    except Exception as e:
-        print(e)
-        sys.exit(1)
-
-    gait_controller.omni_loop()
-    rclpy.shutdown()
+        executor.spin()
+    except KeyboardInterrupt:
+        should_quit = True
+        pass
+    finally:
+        gait_controller.destroy_node()
+        rclpy.shutdown()

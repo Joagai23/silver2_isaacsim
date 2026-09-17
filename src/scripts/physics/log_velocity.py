@@ -1,5 +1,5 @@
 import carb
-from omni.kit.scripting import BehaviorScript
+from omni.behavior.scripting.core import BehaviorScript
 import csv
 import os
 from pxr import UsdPhysics

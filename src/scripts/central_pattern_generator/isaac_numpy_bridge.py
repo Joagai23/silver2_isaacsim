@@ -127,7 +127,12 @@ def main():
     silver2_standing_deg = SILVER2_STANDING_ANGLES_DEG
 
     # Instantiate CPG Controller
-    cpg_controller = HexapodCPGController(leg_mounts=silver2_mounts, link_lengths=silver2_links, dt=SIM_DT)
+    cpg_controller = HexapodCPGController(
+        leg_mounts=silver2_mounts,
+        link_lengths=silver2_links,
+        dt=SIM_DT,
+        gait="wave"
+    )
 
     # 3. Settle on ground in standing posture (60 steps = 0.6s)
     print("[INFO] Holding standing posture for settling...")
@@ -152,12 +157,16 @@ def main():
     # 4. Stream dynamic CPG joint targets
     num_locomotion_steps = 500  # 5 seconds of walking (2.5 full strides)
     ramp_steps = 100  # 1.0 second smooth ramp
-    walking_direction = SILVER2_DIRECTION_MAP["left"]
+    walking_direction = SILVER2_DIRECTION_MAP["right"]
     for step in range(num_locomotion_steps):
         # Linear ramp scale: 0.0 -> 1.0
         ramp = min(1.0, (step + 1) / ramp_steps)
         # Compute joint targets in canonical [6, 3] layout (rad)
-        canonical_targets = cpg_controller.compute_joint_targets(default_feet_body,dir_angle_rad=walking_direction, ramp=ramp)
+        canonical_targets = cpg_controller.compute_joint_targets(
+            default_feet_body,
+            dir_angle_rad=walking_direction,
+            ramp=ramp
+        )
 
         # Route through HAL: Canonical -> PhysX DOF order
         physx_targets = canonical_targets.flatten()[canonical_to_physx]

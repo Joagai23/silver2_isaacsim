@@ -1,3 +1,11 @@
+"""
+Hexapod Central Pattern Generator Controller designed for the SILVER2 monitoring platform.
+Synthesizes:
+ [1] Zhang et al., CCDC 2022 (Analytical 3-DOF IK and Cartesian trajectory mapping).
+ [2] Zhong et al., IEEE TCST 2018 (Centroid-leg frame transformations).
+ [3] Yin et al., ISRIMT 2023 (Explicit stance/swing duty factor Hopf formulation).
+"""
+
 import numpy as np
 
 GAIT_CONFIGS = {
@@ -24,7 +32,7 @@ GAIT_CONFIGS = {
 }
 
 class HexapodCPGController:
-    def __init__(self, leg_mounts, link_lengths, dt=0.01):
+    def __init__(self, leg_mounts, link_lengths, dt=0.01, total_period=2.0, gait="tripod"):
         """
         Args:
             leg_mounts: dict of 6 legs with 'pos': [x, y, z] and 'yaw': angle (rad)
@@ -37,17 +45,12 @@ class HexapodCPGController:
         self.leg_mounts = leg_mounts
         self.leg_names = list(leg_mounts.keys())
         self.num_legs = len(self.leg_names)
+        self.total_period = total_period
 
-        # Precompute static mount offsets
-        self.mount_positions = np.array(
-            [leg_mounts[name]['pos'] for name in self.leg_names], 
-            dtype=np.float64
-        )
-
-        # Precompute static inverse rotation matrices (Eq. 5)
+        # Precompute static mount offsets and inverse yaw transforms (Eq. 5 [1])
+        self.mount_positions = np.array([leg_mounts[name]['pos'] for name in self.leg_names], dtype=np.float64)
         yaws = np.array([leg_mounts[name]['yaw'] for name in self.leg_names], dtype=np.float64)
-        c_y = np.cos(yaws)
-        s_y = np.sin(yaws)
+        c_y, s_y = np.cos(yaws), np.sin(yaws)
 
         self.rot_z_inv = np.zeros((self.num_legs, 3, 3), dtype=np.float64)
         self.rot_z_inv[:, 0, 0] = c_y
@@ -56,10 +59,12 @@ class HexapodCPGController:
         self.rot_z_inv[:, 1, 1] = c_y
         self.rot_z_inv[:, 2, 2] = 1.0
 
-        # CPG Hopf parameters
+        # Oscillator dynamics parameters [3]
         self.alpha = 1.0
         self.mu = 100.0
-        self.omega = np.pi
+        self.radius = np.sqrt(self.mu)
+        self.b = 2.0
+        self.coupling_strength = 0.4
 
         # Trajectory mapping gains
         self.k1 = 1.0
@@ -70,129 +75,147 @@ class HexapodCPGController:
         self.l1 = -0.01
         self.l2 = 0.005
 
-        # Tripod gait phase definitions (L0, L1, L2, L3, L4, L5)
-        self.phi_phase = np.array([0.0, 0.5, 0.0, 0.5, 0.0, 0.5])
+        # Sub-stepping
+        self.sub_steps = 5
+        self.dt_sub = self.dt / self.sub_steps
+        self.diagonal_mask = ~np.eye(self.num_legs, dtype=bool)
 
-        # Precompute coupling matrix: phi_ij = 2 * pi * (phi_i - phi_j)
-        self.phase_diff = 2.0 * np.pi * (self.phi_phase[:, None] - self.phi_phase[None, :])
-        self.sin_diff = np.sin(self.phase_diff)
-        self.cos_diff = np.cos(self.phase_diff)
+        # Initialize gait and seed oscillator limit cycle
+        self.set_gait(gait, reset_state=True)
 
-        # Oscillator initial state
-        self.x = np.array([10.0, -10.0, 10.0, -10.0, 10.0, -10.0])
-        self.y = np.zeros(self.num_legs)
+    def set_gait(self, gait_name: str, reset_state: bool = False):
+        """Switches gait, duty factor, and recalculates phase coupling matrices."""
+        if gait_name not in GAIT_CONFIGS:
+            raise ValueError(f"Unknown gait '{gait_name}'. Choose from: {list(GAIT_CONFIGS.keys())}")
+
+        cfg = GAIT_CONFIGS[gait_name]
+        self.active_gait = gait_name
+        self.epsilon = cfg["epsilon"]
+        self.phi_phase = cfg["phases"]
+
+        # Stance and swing phase speeds (Eq. 2 [3])
+        self.omega_swing = np.pi / ((1.0 - self.epsilon) * self.total_period)
+        self.omega_stance = np.pi / (self.epsilon * self.total_period)
+        self.delta_omega = self.omega_stance - self.omega_swing
+
+        # Coupling matrix based on phase differences: phi_ij = 2 * pi * (phi_i - phi_j)
+        phase_diff = 2.0 * np.pi * (self.phi_phase[:, None] - self.phi_phase[None, :])
+        self.cos_diff = np.cos(phase_diff)
+        self.sin_diff = np.sin(phase_diff)
+
+        # Seed states onto limit cycle only during startup or explicit resets
+        if reset_state or not hasattr(self, 'x'):
+            theta = 2.0 * np.pi * self.phi_phase
+            self.x = self.radius * np.cos(theta)
+            self.y = self.radius * np.sin(theta)
 
     def step_cpg(self):
         """
-        Forward Euler integration of coupled Hopf oscillators.
-        (Eq.7).
+        Forward Euler integration of coupled Hopf oscillators with
+        dynamic duty factor frequency modulation and diffusive phase coupling.
         """
-        sub_steps = 5
-        dt_sub = self.dt / sub_steps
-        diagonal_mask = ~np.eye(self.num_legs, dtype=bool)
+        coupling_weight = self.coupling_strength / (self.num_legs - 1)
 
-        for _ in range(sub_steps):
+        for _ in range(self.sub_steps):
             r2 = self.x**2 + self.y**2
 
-            coupling_x = np.sum((self.x[None, :] * self.cos_diff - self.y[None, :] * self.sin_diff) * diagonal_mask, axis=1)
-            coupling_y = np.sum((self.x[None, :] * self.sin_diff + self.y[None, :] * self.cos_diff) * diagonal_mask, axis=1)
+            # Dual-frequency evaluation using logistic sigmoid (Eq. 2 [3])
+            sigma = 1.0 / (1.0 + np.exp(-np.clip(self.b * self.y, -50.0, 50.0)))
+            omega_i = self.omega_swing + sigma * self.delta_omega
 
-            dx = self.alpha * (self.mu - r2) * self.x - self.omega * self.y + coupling_x
-            dy = self.alpha * (self.mu - r2) * self.y + self.omega * self.x + coupling_y
+            # Rotated neighbor state projections
+            x_rot = self.x[None, :] * self.cos_diff - self.y[None, :] * self.sin_diff
+            y_rot = self.x[None, :] * self.sin_diff + self.y[None, :] * self.cos_diff
 
-            self.x += dx * dt_sub
-            self.y += dy * dt_sub
+            # Diffusive coupling: vanishes at phase lock
+            c_x = np.sum((x_rot - self.x[:, None]) * self.diagonal_mask, axis=1)
+            c_y = np.sum((y_rot - self.y[:, None]) * self.diagonal_mask, axis=1)
 
-    def map_foot_trajectory_linear(self, default_feet_pos_body, ramp=1.0):
-        """
-        Maps (x_i, y_i) to Cartesian coordinates in the centroid frame.
-        default_feet_pos_body: shape (6, 3) representing nominal [x0, y0, z0] per leg.
-        (Eq.8, Eq.9).
-        """
-        x_tilde = self.k1 * self.x
-        y_tilde = np.where(self.y >= 0, self.k2 * self.y + self.b1, self.k3 * self.y + self.b2)
+            coupling_x = coupling_weight * c_x
+            coupling_y = coupling_weight * c_y
 
-        # Target positions in Body Centroid Frame
-        # In Isaac: X is forward, Y is lateral, and Z is vertical
-        p_centroid = default_feet_pos_body.copy()
-        p_centroid[:, 0] = default_feet_pos_body[:, 0]  
-        p_centroid[:, 1] += ramp * self.l1 * x_tilde
-        p_centroid[:, 2] -= ramp * self.l2 * y_tilde
+            # Limit cycle ODE integration (Eq. 3 [3])
+            dx = self.alpha * (self.mu - r2) * self.x - omega_i * self.y + coupling_x
+            dy = self.alpha * (self.mu - r2) * self.y + omega_i * self.x + coupling_y
 
-        return p_centroid
+            self.x += dx * self.dt_sub
+            self.y += dy * self.dt_sub
 
-    def map_foot_trajectory_omnidirectional( self, default_feet_pos_body, dir_angle_rad=0.0, 
-                                            stride_forward=0.01, stride_lateral=0.005, ramp=1.0):
+    def map_foot_trajectory_omnidirectional(
+        self, 
+        default_feet_pos_body, 
+        dir_angle_rad=0.0, 
+        stride_forward=0.01, 
+        stride_lateral=0.005, 
+        ramp=1.0
+    ):
         """
         Omnidirectional Cartesian trajectory mapping.
-        Frame: +X = Front, +Y = Left, +Z = Up
-        
-        dir_angle_rad = 0.0        -> Forward (+X)
-        dir_angle_rad = pi / 2     -> Right (-Y)
-        dir_angle_rad = -pi / 2    -> Left (+Y)
-        dir_angle_rad = pi         -> Backward (-X)
+        Array Layout: Axis 0 = Lateral (X), Axis 1 = Longitudinal (Y), Axis 2 = Up (Z)
         """
         x_tilde = self.k1 * self.x
         y_tilde = np.where(self.y >= 0.0, self.k2 * self.y + self.b1, self.k3 * self.y + self.b2)
 
-        # Decompose stroke into body frame components
-        # Note: negative sign ensures positive velocity along chosen heading
         l_lat = -stride_lateral * np.sin(dir_angle_rad)
         l_fwd = -stride_forward * np.cos(dir_angle_rad)
 
         p_centroid = default_feet_pos_body.copy()
-        p_centroid[:, 0] += ramp * l_lat * x_tilde      # Axis 0: Lateral
-        p_centroid[:, 1] += ramp * l_fwd * x_tilde      # Axis 1: Longitudinal
-        p_centroid[:, 2] -= ramp * self.l2 * y_tilde    # Axis 2: Vertical clearance lift (+Z)
+        p_centroid[:, 0] += ramp * l_lat * x_tilde
+        p_centroid[:, 1] += ramp * l_fwd * x_tilde
+        p_centroid[:, 2] -= ramp * self.l2 * y_tilde
 
         return p_centroid
 
-    def inverse_kinematics(self, p_leg_base, L1, L2, L3):
+    def inverse_kinematics(self, p_leg_base):
         """
         Analytical 3-DOF IK for Coxa (yaw), Femur (pitch), Tibia (pitch).
         p_leg_base: [x, y, z] relative to leg base origin.
-        L1, L2, L3: Link lengths (Coxa, Femur, Tibia).
-        (Eq. 6)
         """
         px, py, pz = p_leg_base
 
         # Joint 1: Coxa - Yaw
         theta_1 = np.arctan2(py, px)
-        c1 = np.cos(theta_1)
-        s1 = np.sin(theta_1)
+        c1, s1 = np.cos(theta_1), np.sin(theta_1)
 
-        # Auxiliary terms: gamma_2, gamma_3
-        gamma_2 = px * c1 + py * s1 - L1
+        # Auxiliary terms: gamma_2
+        gamma_2 = px * c1 + py * s1 - self.L1
 
         # Joint 3: Tibia - Pitch
-        cos_theta_3 = (gamma_2**2 + pz**2 - L2**2 - L3**2) / (2.0 * L2 * L3)
+        cos_theta_3 = (gamma_2**2 + pz**2 - self.L2**2 - self.L3**2) / (2.0 * self.L2 * self.L3)
         theta_3 = np.arccos(np.clip(cos_theta_3, -1.0, 1.0))
 
         # Joint 2: Femur - Pitch
         chord = np.sqrt(gamma_2**2 + pz**2)
         chord_pitch_down = np.arctan2(-pz, gamma_2)
-        psi = np.arcsin(np.clip((L3 * np.sin(theta_3)) / chord, -1.0, 1.0))
+        sin_psi = (self.L3 * np.sin(theta_3)) / chord
+        psi = np.arcsin(np.clip(sin_psi, -1.0, 1.0))
         theta_2 = chord_pitch_down - psi
 
         return np.array([theta_1, theta_2, theta_3])
     
-    def compute_joint_targets(self, default_feet_pos_body, dir_angle_rad=0.0, ramp=1.0):
-        """
-        Executes one control cycle and outputs joint angles (6, 3).
-        (Eq.5, Eq.6)
-        """
+    def compute_joint_targets(
+        self, 
+        default_feet_pos_body, 
+        dir_angle_rad=0.0, 
+        stride_forward=0.01, 
+        stride_lateral=0.005, 
+        ramp=1.0
+    ):
+        """Executes one control cycle and outputs joint angles (6, 3)."""
         self.step_cpg()
-        p_centroid = self.map_foot_trajectory_omnidirectional(default_feet_pos_body, dir_angle_rad=dir_angle_rad, ramp=ramp)
+        p_centroid = self.map_foot_trajectory_omnidirectional(
+            default_feet_pos_body,
+            dir_angle_rad=dir_angle_rad,
+            stride_forward=stride_forward,
+            stride_lateral=stride_lateral,
+            ramp=ramp
+        )
 
-        # Relative offset (6, 3)
         p_rel = p_centroid - self.mount_positions
-
-        # Negative yaw rotation
         p_local_batch = np.einsum('ijk,ik->ij', self.rot_z_inv, p_rel)
 
-        # Solve IK per leg 
         joint_targets = np.zeros((self.num_legs, 3))
         for i in range(self.num_legs):
-            joint_targets[i] = self.inverse_kinematics(p_local_batch[i], self.L1, self.L2, self.L3)
+            joint_targets[i] = self.inverse_kinematics(p_local_batch[i])
 
         return joint_targets

@@ -1,9 +1,9 @@
 """
 Hexapod Central Pattern Generator Controller designed for the SILVER2 monitoring platform.
 Synthesizes:
- [1] Zhang et al., CCDC 2022 (Analytical 3-DOF IK and Cartesian trajectory mapping).
- [2] Zhong et al., IEEE TCST 2018 (Centroid-leg frame transformations).
- [3] Yin et al., ISRIMT 2023 (Explicit stance/swing duty factor Hopf formulation).
+ [1] Zhang et al., "Central Pattern Generators for Locomotion Control in Hexapod Robot Legs", CCDC 2022 
+ [2] Zhong et al., "Locomotion Control and Gait Planning of a Novel Hexapod Robot Using Biomimetic Neurons", IEEE TCST 2018
+ [3] Yin et al., "Energy Efficiency Optimization of Hexapod Robots Based on Central Pattern Generator Control", ISRIMT 2023 
 """
 
 import numpy as np
@@ -146,23 +146,43 @@ class HexapodCPGController:
         default_feet_pos_body, 
         dir_angle_rad=0.0, 
         stride_forward=0.01, 
-        stride_lateral=0.005, 
+        stride_lateral=0.005,
+        yaw_rate=0.0,
+        yaw_gain=0.005,
         ramp=1.0
     ):
         """
-        Omnidirectional Cartesian trajectory mapping.
-        Array Layout: Axis 0 = Lateral (X), Axis 1 = Longitudinal (Y), Axis 2 = Up (Z)
+        Omnidirectional Cartesian trajectory mapping with turning / pivoting superposition.
+        Array Layout: Axis 0 = Lateral (Y), Axis 1 = Longitudinal (X), Axis 2 = Up (Z)
+        
+        Args:
+            default_feet_pos_body: shape (6, 3) nominal foot positions in centroid frame.
+            dir_angle_rad: heading angle in radians (0.0 = Pure Forward).
+            stride_forward: longitudinal translation step size (m).
+            stride_lateral: lateral translation step size (m).
+            yaw_rate: commanded angular rate (+ for CCW / turn left, - for CW / turn right).
+            yaw_gain: scaling factor mapping angular velocity to linear foot displacement.
+            ramp: soft-start scaling factor [0.0, 1.0].
         """
         x_tilde = self.k1 * self.x
         y_tilde = np.where(self.y >= 0.0, self.k2 * self.y + self.b1, self.k3 * self.y + self.b2)
 
-        l_lat = -stride_lateral * np.sin(dir_angle_rad)
-        l_fwd = -stride_forward * np.cos(dir_angle_rad)
+        # Foot anchor coordinates relative to centroid
+        pos_lat = default_feet_pos_body[:, 0]
+        pos_fwd = default_feet_pos_body[:, 1]
 
+        # Base translational strokes
+        l_lat_trans = -stride_lateral * np.sin(dir_angle_rad)
+        l_fwd_trans = -stride_forward * np.cos(dir_angle_rad)
+
+        # Rotational twist
+        l_lat = l_lat_trans - yaw_gain * yaw_rate * pos_fwd
+        l_fwd = l_fwd_trans + yaw_gain * yaw_rate * pos_lat
+        
         p_centroid = default_feet_pos_body.copy()
-        p_centroid[:, 0] += ramp * l_lat * x_tilde
-        p_centroid[:, 1] += ramp * l_fwd * x_tilde
-        p_centroid[:, 2] -= ramp * self.l2 * y_tilde
+        p_centroid[:, 0] += ramp * l_lat * x_tilde    # Axis 0: Lateral
+        p_centroid[:, 1] += ramp * l_fwd * x_tilde    # Axis 1: Longitudinal
+        p_centroid[:, 2] -= ramp * self.l2 * y_tilde  # Axis 2: Vertical
 
         return p_centroid
 
@@ -199,6 +219,8 @@ class HexapodCPGController:
         dir_angle_rad=0.0, 
         stride_forward=0.01, 
         stride_lateral=0.005, 
+        yaw_rate=0.0,
+        yaw_gain=0.005,
         ramp=1.0
     ):
         """Executes one control cycle and outputs joint angles (6, 3)."""
@@ -208,12 +230,16 @@ class HexapodCPGController:
             dir_angle_rad=dir_angle_rad,
             stride_forward=stride_forward,
             stride_lateral=stride_lateral,
+            yaw_rate=yaw_rate,
+            yaw_gain=yaw_gain,
             ramp=ramp
         )
 
+        # Transform from centroid frame to each leg's mounting frame
         p_rel = p_centroid - self.mount_positions
         p_local_batch = np.einsum('ijk,ik->ij', self.rot_z_inv, p_rel)
 
+        # Solve analytical IK per leg
         joint_targets = np.zeros((self.num_legs, 3))
         for i in range(self.num_legs):
             joint_targets[i] = self.inverse_kinematics(p_local_batch[i])

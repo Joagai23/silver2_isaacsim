@@ -13,7 +13,7 @@ from isaacsim.core.prims import Articulation
 from pxr import Gf, UsdGeom, PhysxSchema, Usd, UsdPhysics
 from numpy_cpg_controller import HexapodCPGController
 from isaacsim.core.utils.stage import get_current_stage
-from silver2_isaac_constants import SILVER2_LINKS, SILVER2_MOUNTS, SILVER2_DEFAULT_FEET_BODY, SILVER2_STANDING_ANGLES_DEG, SILVER2_DIRECTION_MAP
+from silver2_isaac_constants import *
 
 # 0. Path Resolution
 USD_PATH = "/home/jorge/Documents/Code/silver2_isaacsim/src/scenes/silver2_isaac_sim_locomotion.usd"
@@ -131,7 +131,7 @@ def main():
         leg_mounts=silver2_mounts,
         link_lengths=silver2_links,
         dt=SIM_DT,
-        gait="wave"
+        gait="tripod"
     )
 
     # 3. Settle on ground in standing posture (60 steps = 0.6s)
@@ -165,6 +165,10 @@ def main():
         canonical_targets = cpg_controller.compute_joint_targets(
             default_feet_body,
             dir_angle_rad=walking_direction,
+            stride_forward=0.01,
+            stride_lateral=0.005,
+            yaw_rate=np.pi / 4,
+            yaw_gain=0.01,
             ramp=ramp
         )
 

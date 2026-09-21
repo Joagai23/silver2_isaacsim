@@ -46,3 +46,37 @@ SILVER2_DIRECTION_MAP = {
     "backward_left":  -3.0 * np.pi / 4.0,
     "forward_left":   -np.pi / 4.0,
 }
+
+# Explicit Stance Parameters
+GAIT_CONFIGS = {
+    "tripod": {
+        "epsilon": 0.5,
+        "phases": np.array([
+            0.0, 0.5, 0.0, 0.5, 0.0, 0.5
+        ])
+    },
+    "quadruped": {
+        "epsilon": 2.0 / 3.0,
+        "phases": np.array([
+            0.0, 1.0 / 3.0, 2.0 / 3.0,
+            2.0 / 3.0, 1.0 / 3.0, 0.0
+        ])
+    },
+    "wave": {
+        "epsilon": 5.0 / 6.0,
+        "phases": np.array([
+            5.0 / 6.0, 4.0 / 6.0, 3.0 / 6.0,
+            2.0 / 6.0, 1.0 / 6.0, 0.0
+        ])
+    }
+}
+
+# Dynamixel XM430 Drive Parameters (Currently Terrestrial)
+K_P = 7000.0 * (np.pi / 180.0) 
+K_D = 160.0 * (np.pi / 180.0)
+MAX_TORQUE = 100.0
+DEFAULT_DRIVES = {
+    "coxa":  {"stiffness": K_P, "damping": K_D, "max_force": MAX_TORQUE},
+    "femur": {"stiffness": K_P, "damping": K_D, "max_force": MAX_TORQUE},
+    "tibia": {"stiffness": K_P, "damping": K_D, "max_force": MAX_TORQUE},
+}

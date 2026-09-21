@@ -10,8 +10,7 @@ import omni
 import os
 from isaacsim.core.api.world import World
 from isaacsim.core.prims import Articulation
-from pxr import Gf, UsdGeom, PhysxSchema, Usd, UsdPhysics
-from numpy_cpg_controller import HexapodCPGController
+from numpy_cpg_controller import NumpyHexapodCPGController
 from isaacsim.core.utils.stage import get_current_stage
 from silver2_isaac_constants import *
 
@@ -127,7 +126,7 @@ def main():
     silver2_standing_deg = SILVER2_STANDING_ANGLES_DEG
 
     # Instantiate CPG Controller
-    cpg_controller = HexapodCPGController(
+    cpg_controller = NumpyHexapodCPGController(
         leg_mounts=silver2_mounts,
         link_lengths=silver2_links,
         dt=SIM_DT,

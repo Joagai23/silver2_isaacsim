@@ -1,5 +1,5 @@
 import numpy as np
-from numpy_cpg_controller import HexapodCPGController
+from numpy_cpg_controller import NumpyHexapodCPGController
 
 def compute_default_feet_body(default_angles_deg, leg_mounts, link_lengths):
     """
@@ -89,7 +89,7 @@ default_feet_body = np.array([
     [-0.39852845,  0.35652845, -0.1507235 ]
 ])
 
-controller = HexapodCPGController(silver2_mounts, silver2_links, dt=0.01)
+controller = NumpyHexapodCPGController(silver2_mounts, silver2_links, dt=0.01)
 
 # Step simulation forward for 200 ticks (2 seconds)
 trajectory_history = []

@@ -7,31 +7,9 @@ Synthesizes:
 """
 
 import numpy as np
+from silver2_isaac_constants import GAIT_CONFIGS
 
-GAIT_CONFIGS = {
-    "tripod": {
-        "epsilon": 0.5,
-        "phases": np.array([
-            0.0, 0.5, 0.0, 0.5, 0.0, 0.5
-        ])
-    },
-    "quadruped": {
-        "epsilon": 2.0 / 3.0,
-        "phases": np.array([
-            0.0, 1.0 / 3.0, 2.0 / 3.0,
-            2.0 / 3.0, 1.0 / 3.0, 0.0
-        ])
-    },
-    "wave": {
-        "epsilon": 5.0 / 6.0,
-        "phases": np.array([
-            5.0 / 6.0, 4.0 / 6.0, 3.0 / 6.0,
-            2.0 / 6.0, 1.0 / 6.0, 0.0
-        ])
-    }
-}
-
-class HexapodCPGController:
+class NumpyHexapodCPGController:
     def __init__(self, leg_mounts, link_lengths, dt=0.01, total_period=2.0, gait="tripod"):
         """
         Args:

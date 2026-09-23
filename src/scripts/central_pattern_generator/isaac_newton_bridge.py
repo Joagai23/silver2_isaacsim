@@ -68,14 +68,16 @@ from isaacsim.core.simulation_manager import SimulationManager
 import isaacsim.physics.newton as newton_ext
 
 from silver2_isaac_constants import *
+from numpy_cpg_controller import NumpyHexapodCPGController
+
 
 # Path Resolution & Simulation Parameters
-USD_PATH = "/home/jorge/Documents/Code/silver2_isaacsim/src/scenes/silver2_isaac_sim_locomotion.usd"
+USD_PATH = "/home/jorge/Documents/Code/silver2_isaacsim/src/scenes/newton/silver2_isaac_sim_locomotion.usd"
 STAGE_NAME = "silver2_isaac_sim_locomotion.usd"
 ROBOT_PRIM_PATH = "/World/SILVER2"
 
-SIM_DT = 1 / 420.0
-RENDER_FPS = 60.0
+SIM_DT = 1 / 100.0
+RENDER_FPS = 30.0
 RENDER_INTERVAL = int(round((1.0 / RENDER_FPS) / SIM_DT))
 
 def audit_and_repair_joints(stage, robot_root_path=ROBOT_PRIM_PATH):
@@ -181,17 +183,48 @@ def main():
         device=DEVICE
     )
 
+    # Instantiate CPG Controller
+    cpg_controller = NumpyHexapodCPGController(
+        leg_mounts=SILVER2_MOUNTS,
+        link_lengths=SILVER2_LINKS,
+        dt=SIM_DT,
+        gait="tripod"
+    )
+
     # Standing Posture (Preallocated GPU Buffers)
     standing_targets_deg = np.array(SILVER2_STANDING_ANGLES_DEG, dtype=np.float32).flatten()
     standing_targets_rad = np.deg2rad(standing_targets_deg).astype(np.float32)
+    standing_targets_gpu = torch.as_tensor(standing_targets_rad, dtype=torch.float32, device=DEVICE)
+    torch_targets = standing_targets_gpu[canonical_to_newton].unsqueeze(0)
 
-    canonical_targets_gpu = torch.as_tensor(standing_targets_rad, dtype=torch.float32, device=DEVICE)
-    torch_targets = canonical_targets_gpu[canonical_to_newton].unsqueeze(0)
-
-    print("[INFO] Running 1000 settling steps...")
-    for step in range(1000):
+    for step in range(120):
         robot_view.set_joint_position_targets(torch_targets)
-        
+        should_render = RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0)
+        world.step(render=should_render)
+
+    # Numpy CPG Parameters
+    num_locomotion_steps = 1000
+    ramp_steps = 200  # 1.0 second smooth ramp
+    walking_direction = SILVER2_DIRECTION_MAP["right"]
+
+    print("[INFO] Running {} settling steps...".format(num_locomotion_steps))
+    for step in range(num_locomotion_steps):
+
+        ramp = min(1.0, (step + 1) / ramp_steps)
+        canonical_targets = cpg_controller.compute_joint_targets(
+            SILVER2_DEFAULT_FEET_BODY,
+            dir_angle_rad=walking_direction,
+            stride_forward=0.01,
+            stride_lateral=0.005,
+            yaw_rate=0.0,
+            yaw_gain=0.01,
+            ramp=ramp
+        )
+
+        cpg_targets_gpu = torch.as_tensor(canonical_targets.flatten(), dtype=torch.float32, device=DEVICE)
+        cpg_torch_targets = cpg_targets_gpu[canonical_to_newton].unsqueeze(0)
+        robot_view.set_joint_position_targets(cpg_torch_targets)
+
         # Substep physics
         should_render = RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0)
         world.step(render=should_render)

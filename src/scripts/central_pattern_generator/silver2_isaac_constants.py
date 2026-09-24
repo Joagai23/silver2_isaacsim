@@ -72,9 +72,9 @@ GAIT_CONFIGS = {
 }
 
 # Dynamixel XM430 Drive Parameters (Currently Terrestrial)
-K_P = 7000.0 * (np.pi / 180.0) 
-K_D = 160.0 * (np.pi / 180.0)
-MAX_TORQUE = 100.0
+K_P = 800.0 # Realistic Kp = 35.0
+K_D = 25.0 # Realistic Kd = 1.5
+MAX_TORQUE = 500.0 # Realistic Max. Torque = 4.8
 DEFAULT_DRIVES = {
     "coxa":  {"stiffness": K_P, "damping": K_D, "max_force": MAX_TORQUE},
     "femur": {"stiffness": K_P, "damping": K_D, "max_force": MAX_TORQUE},

@@ -1,3 +1,8 @@
+"""
+Independent Diagnostic Test: Actuator Mechanical Phase Lag & Dynamic Tracking (Test 3)
+Instruments SILVER2 in Newton GPU physics to quantify dynamic tracking lag.
+"""
+
 RENDER_SIMULATION = True
 
 import isaacsim
@@ -9,7 +14,6 @@ config = {
 }
 simulation_app = SimulationApp(config)
 
-# Enable verified Newton extensions
 from isaacsim.core.utils.extensions import enable_extension
 enable_extension("omni.usd.schema.newton")
 enable_extension("isaacsim.physics.newton")
@@ -18,11 +22,9 @@ enable_extension("isaacsim.physics.newton.tensors")
 import torch
 import numpy as np
 import omni
-import warp as wp
 from pxr import Usd, UsdPhysics, Gf, Sdf
 
 DEVICE = "cuda:0"
-wp.init()
 torch.set_default_device(DEVICE)
 
 # Cross-Device Safe Tensor Assign Interceptor
@@ -32,7 +34,6 @@ import isaacsim.core.utils.torch as torch_utils
 _orig_assign = torch_tensor_utils.assign
 
 def _safe_assign(dst, src, indices):
-    """Ensures src and indices match dst device before in-place slice assignment."""
     if isinstance(dst, torch.Tensor):
         dev = dst.device
         if isinstance(src, torch.Tensor):
@@ -67,22 +68,24 @@ from isaacsim.core.utils.stage import get_current_stage
 from isaacsim.core.simulation_manager import SimulationManager
 import isaacsim.physics.newton as newton_ext
 
-from silver2_isaac_constants import *
-from numpy_cpg_controller import NumpyHexapodCPGController
+from ..silver2_isaac_constants import *
+from ..numpy_cpg_controller import NumpyHexapodCPGController
 
-
-# Path Resolution & Simulation Parameters
+# ------------------------------------------------------------------------------
+# Simulation Parameters
+# ------------------------------------------------------------------------------
 USD_PATH = "/home/jorge/Documents/Code/silver2_isaacsim/src/scenes/newton/silver2_isaac_sim_locomotion.usd"
 STAGE_NAME = "silver2_isaac_sim_locomotion.usd"
 ROBOT_PRIM_PATH = "/World/SILVER2"
 
-SIM_DT = 1 / 420.0
+SIM_DT = 1.0 / 420.0
 RENDER_FPS = 60.0
 RENDER_INTERVAL = int(round((1.0 / RENDER_FPS) / SIM_DT))
-DECIMATION_RATIO = 4
+DECIMATION = 4
+CPG_DT = SIM_DT * DECIMATION  # ~0.009524 s (105 Hz)
+
 
 def audit_and_repair_joints(stage, robot_root_path=ROBOT_PRIM_PATH):
-    """Explicit UsdPhysics.DriveAPI properties for all joints in the Hexapod Robot."""
     robot_prim = stage.GetPrimAtPath(robot_root_path)
     if not robot_prim.IsValid():
         raise RuntimeError(f"Robot root prim not found at {robot_root_path}")
@@ -105,8 +108,8 @@ def audit_and_repair_joints(stage, robot_root_path=ROBOT_PRIM_PATH):
         rev.CreateLowerLimitAttr().Set(-180.0)
         rev.CreateUpperLimitAttr().Set(180.0)
 
+
 def setup_newton_scene(stage, physics_scene_path="/physicsScene"):
-    """Configures USD PhysicsScene prim attributes for Newton GPU execution."""
     scene_prim = stage.GetPrimAtPath(physics_scene_path)
     if not scene_prim.IsValid():
         scene = UsdPhysics.Scene.Define(stage, physics_scene_path)
@@ -120,9 +123,9 @@ def setup_newton_scene(stage, physics_scene_path="/physicsScene"):
         scene_prim.GetAttribute("physics:engine").Set("Newton")
     else:
         scene_prim.CreateAttribute("physics:engine", Sdf.ValueTypeNames.Token).Set("Newton")
-        
+
+
 def main():
-    # Stage Init.
     usd_context = omni.usd.get_context()
     current_stage_url = usd_context.get_stage_url() or ""
 
@@ -139,7 +142,6 @@ def main():
     if ns is not None:
         ns.cfg.solver_cfg.nconmax = 1000
 
-    # World Init.
     world = World.instance()
     if world is None:
         world = World(
@@ -152,7 +154,6 @@ def main():
         )
     world.initialize_physics()
 
-    # Bind Articualtion
     robot_name = "SILVER2_robot"
     if world.scene.object_exists(robot_name):
         robot_view = world.scene.get_object(robot_name)
@@ -183,22 +184,25 @@ def main():
         dtype=torch.long,
         device=DEVICE
     )
+
+    # Invert mapping so we can extract measured Newton states back into canonical order
+    # newton_to_canonical maps: canonical_index = newton_to_canonical[dof_index]
     newton_to_canonical = torch.tensor(
         [dof_names.index(name) for name in canonical_joint_names],
         dtype=torch.long,
         device=DEVICE
     )
 
-    # Instantiate CPG Controller
-    cpg_dt = SIM_DT * DECIMATION_RATIO
+    # Instantiate Controller
     cpg_controller = NumpyHexapodCPGController(
         leg_mounts=SILVER2_MOUNTS,
         link_lengths=SILVER2_LINKS,
-        dt=cpg_dt,
+        dt=CPG_DT,
+        total_period=2.0,
         gait="tripod"
     )
 
-    # Dynamically-computed standing pose
+    # 1. Settle in Standing Posture for 100 Steps
     standing_targets_deg = np.array(SILVER2_STANDING_ANGLES_DEG, dtype=np.float32).flatten()
     standing_targets_rad = np.deg2rad(standing_targets_deg).astype(np.float32)
     standing_targets_gpu = torch.as_tensor(standing_targets_rad, dtype=torch.float32, device=DEVICE)
@@ -207,50 +211,112 @@ def main():
     robot_view.set_joint_positions(torch_standing_targets)
     robot_view.set_joint_velocities(torch.zeros_like(torch_standing_targets))
 
-    for step in range(1000):
+    print("\n[INFO] Settling in standing posture (100 steps)...")
+    for step in range(100):
         robot_view.set_joint_position_targets(torch_standing_targets)
         world.step(render=RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0))
 
-    # Extract true loaded joint angles (in degrees, shaped (6, 3))
-    settled_q_rad = robot_view.get_joint_positions().squeeze()[newton_to_canonical].cpu().numpy()
-    settled_q_deg = np.rad2deg(settled_q_rad).reshape((6, 3))
+    # 2. Test Execution: Log 3 Complete Strides (6.0 seconds = 630 CPG ticks = 2520 physics steps)
+    TOTAL_PERIOD = 2.0
+    NUM_CYCLES = 3
+    TOTAL_TIME = NUM_CYCLES * TOTAL_PERIOD
+    NUM_PHYSICS_STEPS = int(round(TOTAL_TIME / SIM_DT))
+    NUM_CPG_TICKS = NUM_PHYSICS_STEPS // DECIMATION
 
-    # Compute empirical foot baseline directly from settled physics
-    calibrated_feet_body = cpg_controller.compute_default_feet_body(settled_q_deg, SILVER2_MOUNTS, SILVER2_LINKS)
+    print("=" * 80)
+    print(f"RUNNING TEST 3: LOGGING {NUM_CYCLES} CYCLES ({TOTAL_TIME:.1f} s) OF ACTIVE LOCOMOTION")
+    print(f"Sampling Rate: {1.0 / CPG_DT:.1f} Hz ({NUM_CPG_TICKS} control samples)")
+    print("=" * 80)
 
-    # Numpy CPG Parameters
-    num_locomotion_steps = 2000
-    ramp_steps = 200 
-    walking_direction = SILVER2_DIRECTION_MAP["right"]
+    # Preallocate telemetry buffers (shape: [NUM_CPG_TICKS, 18])
+    time_log = np.zeros(NUM_CPG_TICKS)
+    target_q_log = np.zeros((NUM_CPG_TICKS, 18))
+    actual_q_log = np.zeros((NUM_CPG_TICKS, 18))
 
-    print("[INFO] Running {} settling steps...".format(num_locomotion_steps))
-    for step in range(num_locomotion_steps):
-        if step % DECIMATION_RATIO == 0:
-            ramp = min(1.0, (step + 1) / ramp_steps)
+    current_targets = torch_standing_targets
+    cpg_tick = 0
+
+    for step in range(NUM_PHYSICS_STEPS):
+        if step % DECIMATION == 0 and cpg_tick < NUM_CPG_TICKS:
+            time_log[cpg_tick] = cpg_tick * CPG_DT
+
+            # Compute CPG targets
             canonical_targets = cpg_controller.compute_joint_targets(
-                calibrated_feet_body,
-                dir_angle_rad=walking_direction,
+                SILVER2_DEFAULT_FEET_BODY,
+                dir_angle_rad=0.0,
                 stride_forward=0.005,
                 stride_lateral=0.005,
                 yaw_rate=0.0,
-                yaw_gain=0.0,
-                ramp=ramp
+                yaw_gain=0.01,
+                ramp=1.0
             )
+            canonical_flat = canonical_targets.flatten()
+            target_q_log[cpg_tick] = canonical_flat
 
-            cpg_targets_gpu = torch.as_tensor(canonical_targets.flatten(), dtype=torch.float32, device=DEVICE)
+            # Convert to Newton ordering
+            cpg_targets_gpu = torch.as_tensor(canonical_flat, dtype=torch.float32, device=DEVICE)
             current_targets = cpg_targets_gpu[canonical_to_newton].unsqueeze(0)
 
-        # Hold targets across 420 Hz physics steps; render viewport at 60 Hz
+            # Sample actual joint positions (mapped back to canonical ordering)
+            measured_newton_q = robot_view.get_joint_positions().squeeze()
+            measured_canonical_q = measured_newton_q[newton_to_canonical].cpu().numpy()
+            actual_q_log[cpg_tick] = measured_canonical_q
+
+            cpg_tick += 1
+
         robot_view.set_joint_position_targets(current_targets)
         should_render = RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0)
         world.step(render=should_render)
 
-    poses, _ = robot_view.get_world_poses()
-    initial_pos = poses[0].cpu().numpy()
-    print(f"[INFO] Settled Position: X={initial_pos[0]:.3f}, Y={initial_pos[1]:.3f}, Z={initial_pos[2]:.3f} m")
+    # 3. Post-Processing & Telemetry Analysis
+    print("\n" + "=" * 90)
+    print(f"{'Probe Joint':<16} | {'Phase Lag (ms)':<15} | {'Amp Ratio (%)':<15} | {'Max Error (deg)':<16} | {'RMS Error (deg)'}")
+    print("=" * 90)
+
+    # Probe representative joints: Leg 0 (Front-Left), Leg 1 (Middle-Left), Leg 4 (Middle-Right)
+    probe_indices = [
+        (0, "Leg 0 Coxa"),
+        (1, "Leg 0 Femur"),
+        (2, "Leg 0 Tibia"),
+        (3, "Leg 1 Coxa"),
+        (4, "Leg 1 Femur"),
+        (5, "Leg 1 Tibia"),
+        (12, "Leg 4 Coxa"),
+        (13, "Leg 4 Femur"),
+        (14, "Leg 4 Tibia"),
+    ]
+
+    for j_idx, j_name in probe_indices:
+        cmd_series = target_q_log[:, j_idx]
+        act_series = actual_q_log[:, j_idx]
+
+        # Ignore initial settling tick if any
+        cmd = cmd_series - np.mean(cmd_series)
+        act = act_series - np.mean(act_series)
+
+        # Cross-Correlation to find mechanical phase delay
+        corr = np.correlate(act, cmd, mode='full')
+        lags = np.arange(-len(cmd) + 1, len(cmd))
+        best_lag_idx = lags[np.argmax(corr)]
+        time_lag_ms = best_lag_idx * CPG_DT * 1000.0
+
+        # Amplitude range (attenuation)
+        cmd_range = np.ptp(cmd_series)
+        act_range = np.ptp(act_series)
+        amp_ratio_pct = (act_range / cmd_range * 100.0) if cmd_range > 1e-4 else 100.0
+
+        # Tracking error statistics in degrees
+        err_deg = np.rad2deg(act_series - cmd_series)
+        max_err = np.max(np.abs(err_deg))
+        rms_err = np.sqrt(np.mean(err_deg**2))
+
+        print(f"{j_name:<16} | {time_lag_ms:10.1f} ms    | {amp_ratio_pct:10.1f} %    | {max_err:11.2f}°       | {rms_err:10.2f}°")
+
+    print("=" * 90 + "\n")
 
     world.stop()
     simulation_app.close()
+
 
 if __name__ == "__main__":
     main()

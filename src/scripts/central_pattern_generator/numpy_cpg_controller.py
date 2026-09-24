@@ -190,6 +190,62 @@ class NumpyHexapodCPGController:
         theta_2 = chord_pitch_down - psi
 
         return np.array([theta_1, theta_2, theta_3])
+
+    def compute_default_feet_body(self, default_angles_deg, leg_mounts, link_lengths):
+        """
+        Computes nominal foot positions in the centroid frame (Eq. 2 & Eq. 4 [1]).
+        
+        Args:
+            default_angles_deg: Array-like of joint angles [coxa, femur, tibia] in degrees.
+                                Can be shape (3,) if identical across all legs, 
+                                or shape (6, 3) for per-leg configurations.
+            leg_mounts: Dict defining 'pos' and 'yaw' for each leg.
+            link_lengths: Tuple (L1, L2, L3) in meters.
+            
+        Returns:
+            np.ndarray: default_feet_body of shape (6, 3) in robot centroid frame.
+        """
+        L1, L2, L3 = link_lengths
+        leg_names = list(leg_mounts.keys())
+        num_legs = len(leg_names)
+
+        angles_deg = np.array(default_angles_deg, dtype=np.float64)
+        if angles_deg.ndim == 1 and angles_deg.shape[0] == 3:
+            angles_deg = np.tile(angles_deg, (num_legs, 1))
+
+        angles_rad = np.radians(angles_deg)
+        default_feet_body = np.zeros((num_legs, 3), dtype=np.float64)
+
+        for i, name in enumerate(leg_names):
+            theta1, theta2, theta3 = angles_rad[i]
+            
+            # Forward Kinematics in Leg Base Frame (Eq. 2)
+            c1, s1 = np.cos(theta1), np.sin(theta1)
+            c2, s2 = np.cos(theta2), np.sin(theta2)
+            c23 = np.cos(theta2 + theta3)
+            s23 = np.sin(theta2 + theta3)
+
+            p_o0 = np.array([
+                L1 * c1 + L2 * c1 * c2 + L3 * c1 * c23,
+                L1 * s1 + L2 * s1 * c2 + L3 * s1 * c23,
+                -(L2 * s2 + L3 * s23)  # Negated for Isaac Sim Y-axis pitch
+            ])
+
+            # Centroid Frame Transformation: R_z(phi) * p_o0 + t_base (Eq. 4)
+            mount = leg_mounts[name]
+            p_mount = np.array(mount['pos'])
+            phi = mount['yaw']
+
+            c_phi, s_phi = np.cos(phi), np.sin(phi)
+            rot_z = np.array([
+                [c_phi, -s_phi, 0.0],
+                [s_phi,  c_phi, 0.0],
+                [  0.0,    0.0, 1.0]
+            ])
+
+            default_feet_body[i] = rot_z @ p_o0 + p_mount
+
+        return default_feet_body
     
     def compute_joint_targets(
         self, 

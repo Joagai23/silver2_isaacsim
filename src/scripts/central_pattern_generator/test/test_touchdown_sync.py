@@ -1,3 +1,8 @@
+"""
+Independent Diagnostic Test: Touchdown Event vs. Limit Cycle State Verification (Test 4)
+Quantifies phase synchronization between physical ground contact and CPG limit cycle states.
+"""
+
 RENDER_SIMULATION = True
 
 import isaacsim
@@ -9,7 +14,6 @@ config = {
 }
 simulation_app = SimulationApp(config)
 
-# Enable verified Newton extensions
 from isaacsim.core.utils.extensions import enable_extension
 enable_extension("omni.usd.schema.newton")
 enable_extension("isaacsim.physics.newton")
@@ -18,11 +22,9 @@ enable_extension("isaacsim.physics.newton.tensors")
 import torch
 import numpy as np
 import omni
-import warp as wp
 from pxr import Usd, UsdPhysics, Gf, Sdf
 
 DEVICE = "cuda:0"
-wp.init()
 torch.set_default_device(DEVICE)
 
 # Cross-Device Safe Tensor Assign Interceptor
@@ -32,7 +34,6 @@ import isaacsim.core.utils.torch as torch_utils
 _orig_assign = torch_tensor_utils.assign
 
 def _safe_assign(dst, src, indices):
-    """Ensures src and indices match dst device before in-place slice assignment."""
     if isinstance(dst, torch.Tensor):
         dev = dst.device
         if isinstance(src, torch.Tensor):
@@ -67,22 +68,21 @@ from isaacsim.core.utils.stage import get_current_stage
 from isaacsim.core.simulation_manager import SimulationManager
 import isaacsim.physics.newton as newton_ext
 
-from silver2_isaac_constants import *
-from numpy_cpg_controller import NumpyHexapodCPGController
+from ..silver2_isaac_constants import *
+from ..numpy_cpg_controller import NumpyHexapodCPGController
 
-
-# Path Resolution & Simulation Parameters
 USD_PATH = "/home/jorge/Documents/Code/silver2_isaacsim/src/scenes/newton/silver2_isaac_sim_locomotion.usd"
 STAGE_NAME = "silver2_isaac_sim_locomotion.usd"
 ROBOT_PRIM_PATH = "/World/SILVER2"
 
-SIM_DT = 1 / 420.0
+SIM_DT = 1.0 / 420.0
 RENDER_FPS = 60.0
 RENDER_INTERVAL = int(round((1.0 / RENDER_FPS) / SIM_DT))
-DECIMATION_RATIO = 4
+DECIMATION = 4
+CPG_DT = SIM_DT * DECIMATION
+
 
 def audit_and_repair_joints(stage, robot_root_path=ROBOT_PRIM_PATH):
-    """Explicit UsdPhysics.DriveAPI properties for all joints in the Hexapod Robot."""
     robot_prim = stage.GetPrimAtPath(robot_root_path)
     if not robot_prim.IsValid():
         raise RuntimeError(f"Robot root prim not found at {robot_root_path}")
@@ -105,8 +105,8 @@ def audit_and_repair_joints(stage, robot_root_path=ROBOT_PRIM_PATH):
         rev.CreateLowerLimitAttr().Set(-180.0)
         rev.CreateUpperLimitAttr().Set(180.0)
 
+
 def setup_newton_scene(stage, physics_scene_path="/physicsScene"):
-    """Configures USD PhysicsScene prim attributes for Newton GPU execution."""
     scene_prim = stage.GetPrimAtPath(physics_scene_path)
     if not scene_prim.IsValid():
         scene = UsdPhysics.Scene.Define(stage, physics_scene_path)
@@ -120,14 +120,25 @@ def setup_newton_scene(stage, physics_scene_path="/physicsScene"):
         scene_prim.GetAttribute("physics:engine").Set("Newton")
     else:
         scene_prim.CreateAttribute("physics:engine", Sdf.ValueTypeNames.Token).Set("Newton")
-        
+
+def forward_kinematics_foot(q_coxa, q_femur, q_tibia, link_lengths):
+    """Computes operational-space foot position relative to leg base."""
+    L1, L2, L3 = link_lengths
+    c1, s1 = np.cos(q_coxa), np.sin(q_coxa)
+    
+    # Analytical FK matching SILVER2 coordinate frame
+    r = L1 + L2 * np.cos(q_femur) + L3 * np.cos(q_femur + q_tibia - np.pi)
+    z = L2 * np.sin(q_femur) + L3 * np.sin(q_femur + q_tibia - np.pi)
+    x = r * c1
+    y = r * s1
+    return np.array([x, y, z])
+
 def main():
-    # Stage Init.
     usd_context = omni.usd.get_context()
     current_stage_url = usd_context.get_stage_url() or ""
 
     if STAGE_NAME not in current_stage_url:
-        print(f"[INFO] Loading stage into Newton environment: {USD_PATH}")
+        print(f"[INFO] Loading stage: {USD_PATH}")
         usd_context.open_stage(USD_PATH)
 
     stage = get_current_stage()
@@ -139,7 +150,6 @@ def main():
     if ns is not None:
         ns.cfg.solver_cfg.nconmax = 1000
 
-    # World Init.
     world = World.instance()
     if world is None:
         world = World(
@@ -152,7 +162,6 @@ def main():
         )
     world.initialize_physics()
 
-    # Bind Articualtion
     robot_name = "SILVER2_robot"
     if world.scene.object_exists(robot_name):
         robot_view = world.scene.get_object(robot_name)
@@ -168,7 +177,7 @@ def main():
         world.play()
     world.reset()
 
-    # Hardware Abstraction Mapping Setup
+    # Index mapping
     canonical_joint_names = []
     for leg_idx in range(6):
         canonical_joint_names.append(f"coxa_joint_{leg_idx}")
@@ -176,8 +185,6 @@ def main():
         canonical_joint_names.append(f"tibia_joint_{leg_idx}")
 
     dof_names = list(robot_view.dof_names)
-    num_dofs = len(dof_names)
-
     canonical_to_newton = torch.tensor(
         [canonical_joint_names.index(name) for name in dof_names],
         dtype=torch.long,
@@ -189,16 +196,17 @@ def main():
         device=DEVICE
     )
 
-    # Instantiate CPG Controller
-    cpg_dt = SIM_DT * DECIMATION_RATIO
+    # Controller with verified clearance (l2 = 0.010)
     cpg_controller = NumpyHexapodCPGController(
         leg_mounts=SILVER2_MOUNTS,
         link_lengths=SILVER2_LINKS,
-        dt=cpg_dt,
+        dt=CPG_DT,
+        total_period=2.0,
         gait="tripod"
     )
+    cpg_controller.l2 = 0.010
 
-    # Dynamically-computed standing pose
+    # 1. Standing posture settle
     standing_targets_deg = np.array(SILVER2_STANDING_ANGLES_DEG, dtype=np.float32).flatten()
     standing_targets_rad = np.deg2rad(standing_targets_deg).astype(np.float32)
     standing_targets_gpu = torch.as_tensor(standing_targets_rad, dtype=torch.float32, device=DEVICE)
@@ -218,36 +226,100 @@ def main():
     # Compute empirical foot baseline directly from settled physics
     calibrated_feet_body = cpg_controller.compute_default_feet_body(settled_q_deg, SILVER2_MOUNTS, SILVER2_LINKS)
 
-    # Numpy CPG Parameters
-    num_locomotion_steps = 2000
-    ramp_steps = 200 
-    walking_direction = SILVER2_DIRECTION_MAP["right"]
+    print("\n[INFO] Auto-Calibrated Feet Z-Coordinates (incorporating gravity sag):")
+    for i in range(6):
+        print(f"  Leg {i}: Z = {calibrated_feet_body[i, 2]:.4f} m (Nominal: {SILVER2_DEFAULT_FEET_BODY[i, 2]:.4f} m)")
 
-    print("[INFO] Running {} settling steps...".format(num_locomotion_steps))
-    for step in range(num_locomotion_steps):
-        if step % DECIMATION_RATIO == 0:
-            ramp = min(1.0, (step + 1) / ramp_steps)
+    # 2. Run Test 4: 3 Strides (630 CPG ticks)
+    TOTAL_PERIOD = 2.0
+    NUM_CYCLES = 3
+    TOTAL_STEPS = int(round((NUM_CYCLES * TOTAL_PERIOD) / SIM_DT))
+    NUM_CPG_TICKS = TOTAL_STEPS // DECIMATION
+
+    print("=" * 80)
+    print(f"RUNNING TEST 4: EVALUATING TOUCHDOWN TIMING ACROSS {NUM_CYCLES} CYCLES")
+    print(f"Parameters: l2 = {cpg_controller.l2:.3f}, Stride Forward = 0.005 m")
+    print("=" * 80)
+
+    time_log = np.zeros(NUM_CPG_TICKS)
+    y_state_log = np.zeros((NUM_CPG_TICKS, 6))
+    foot_world_z_log = np.zeros((NUM_CPG_TICKS, 6))
+
+    current_targets = torch_standing_targets
+    cpg_tick = 0
+
+    for step in range(TOTAL_STEPS):
+        if step % DECIMATION == 0 and cpg_tick < NUM_CPG_TICKS:
+            time_log[cpg_tick] = cpg_tick * CPG_DT
+
             canonical_targets = cpg_controller.compute_joint_targets(
                 calibrated_feet_body,
-                dir_angle_rad=walking_direction,
+                dir_angle_rad=0.0,
                 stride_forward=0.005,
-                stride_lateral=0.005,
+                stride_lateral=0.000,
                 yaw_rate=0.0,
-                yaw_gain=0.0,
-                ramp=ramp
+                ramp=1.0
             )
 
+            # Store oscillator state y
+            y_state_log[cpg_tick] = cpg_controller.y.copy()
+
+            # Stream targets
             cpg_targets_gpu = torch.as_tensor(canonical_targets.flatten(), dtype=torch.float32, device=DEVICE)
             current_targets = cpg_targets_gpu[canonical_to_newton].unsqueeze(0)
 
-        # Hold targets across 420 Hz physics steps; render viewport at 60 Hz
-        robot_view.set_joint_position_targets(current_targets)
-        should_render = RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0)
-        world.step(render=should_render)
+            # Read actual joints and compute foot world Z
+            curr_poses, _ = robot_view.get_world_poses()
+            body_z = curr_poses[0, 2].item()
+            measured_q = robot_view.get_joint_positions().squeeze()[newton_to_canonical].cpu().numpy()
 
-    poses, _ = robot_view.get_world_poses()
-    initial_pos = poses[0].cpu().numpy()
-    print(f"[INFO] Settled Position: X={initial_pos[0]:.3f}, Y={initial_pos[1]:.3f}, Z={initial_pos[2]:.3f} m")
+            for leg_i in range(6):
+                q_leg = measured_q[leg_i * 3 : leg_i * 3 + 3]
+                p_foot_local = forward_kinematics_foot(q_leg[0], q_leg[1], q_leg[2], SILVER2_LINKS)
+                # World Z = Body Z + Mount Z + Foot Local Z
+                mount_z = SILVER2_MOUNTS[cpg_controller.leg_names[leg_i]]['pos'][2]
+                foot_world_z_log[cpg_tick, leg_i] = body_z + mount_z + p_foot_local[2]
+
+            cpg_tick += 1
+
+        robot_view.set_joint_position_targets(current_targets)
+        world.step(render=RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0))
+
+    # 3. Post-Process Touchdown Timing
+    print("\n" + "=" * 90)
+    print(f"{'Leg':<8} | {'Cycle #':<10} | {'Touchdown t (s)':<18} | {'y at Touchdown':<18} | {'Phase Error (deg)'} | {'Status'}")
+    print("=" * 90)
+
+    for leg_i in [0, 1]:  # Inspect representative front and middle legs
+        y_series = y_state_log[:, leg_i]
+        z_series = foot_world_z_log[:, leg_i]
+
+        # Stance contact threshold (lowest 15% of vertical stroke)
+        z_ground_contact = np.min(z_series) + 0.008
+
+        # Detect swing-to-stance touchdown events (descent phase crossing ground threshold)
+        for k in range(1, NUM_CPG_TICKS - 1):
+            is_descending = z_series[k] < z_series[k - 1]
+            crossed_to_ground = z_series[k - 1] >= z_ground_contact and z_series[k] < z_ground_contact
+            
+            if crossed_to_ground and is_descending:
+                t_td = time_log[k]
+                y_td = y_series[k]
+                
+                # Phase angle on limit cycle: phi = arctan2(y, x)
+                # At ideal touchdown (y = 0), phase = 0 deg
+                phase_error_deg = np.rad2deg(np.arcsin(np.clip(y_td / 10.0, -1.0, 1.0)))
+
+                if abs(y_td) <= 1.0:
+                    status = "EXCELLENT"
+                elif y_td < -1.0:
+                    status = "EARLY (Stubbing risk)"
+                else:
+                    status = "LATE (Lost traction)"
+
+                print(f"Leg {leg_i:<4} | t = {t_td:6.3f} s | {t_td:14.3f} s   | y = {y_td:11.3f}   | {phase_error_deg:14.1f}°   | {status}")
+
+    print("=" * 90 + "\n")
 
     world.stop()
     simulation_app.close()

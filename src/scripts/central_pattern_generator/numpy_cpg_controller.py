@@ -101,7 +101,7 @@ class NumpyHexapodCPGController:
             sigma = 1.0 / (1.0 + np.exp(-np.clip(self.b * self.y, -50.0, 50.0)))
             omega_i = self.omega_swing + sigma * self.delta_omega
 
-            # Rotated neighbor state projections
+            # Rotated neighbor state projections (Eq. 7 [1])
             x_rot = self.x[None, :] * self.cos_diff - self.y[None, :] * self.sin_diff
             y_rot = self.x[None, :] * self.sin_diff + self.y[None, :] * self.cos_diff
 
@@ -142,6 +142,7 @@ class NumpyHexapodCPGController:
             yaw_gain: scaling factor mapping angular velocity to linear foot displacement.
             ramp: soft-start scaling factor [0.0, 1.0].
         """
+        # (Eq. 8 [1])
         x_tilde = self.k1 * self.x
         y_tilde = np.where(self.y >= 0.0, self.k2 * self.y + self.b1, self.k3 * self.y + self.b2)
 
@@ -156,7 +157,8 @@ class NumpyHexapodCPGController:
         # Rotational twist
         l_lat = l_lat_trans - yaw_gain * yaw_rate * pos_fwd
         l_fwd = l_fwd_trans + yaw_gain * yaw_rate * pos_lat
-        
+
+        # (Eq. 9 [1])
         p_centroid = default_feet_pos_body.copy()
         p_centroid[:, 0] += ramp * l_lat * x_tilde    # Axis 0: Lateral
         p_centroid[:, 1] += ramp * l_fwd * x_tilde    # Axis 1: Longitudinal
@@ -169,6 +171,7 @@ class NumpyHexapodCPGController:
         Analytical 3-DOF IK for Coxa (yaw), Femur (pitch), Tibia (pitch).
         p_leg_base: [x, y, z] relative to leg base origin.
         """
+        # (Eq.6 [1])
         px, py, pz = p_leg_base
 
         # Joint 1: Coxa - Yaw
@@ -219,7 +222,7 @@ class NumpyHexapodCPGController:
         for i, name in enumerate(leg_names):
             theta1, theta2, theta3 = angles_rad[i]
             
-            # Forward Kinematics in Leg Base Frame (Eq. 2)
+            # Forward Kinematics in Leg Base Frame (Eq. 2 [1])
             c1, s1 = np.cos(theta1), np.sin(theta1)
             c2, s2 = np.cos(theta2), np.sin(theta2)
             c23 = np.cos(theta2 + theta3)
@@ -231,7 +234,7 @@ class NumpyHexapodCPGController:
                 -(L2 * s2 + L3 * s23)  # Negated for Isaac Sim Y-axis pitch
             ])
 
-            # Centroid Frame Transformation: R_z(phi) * p_o0 + t_base (Eq. 4)
+            # Centroid Frame Transformation: R_z(phi) * p_o0 + t_base (Eq. 4 [1])
             mount = leg_mounts[name]
             p_mount = np.array(mount['pos'])
             phi = mount['yaw']

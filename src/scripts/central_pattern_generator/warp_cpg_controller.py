@@ -1,6 +1,8 @@
 import warp as wp
 import numpy as np
 from typing import Dict, Tuple, Any
+from silver2_isaac_constants import *
+from warp_cpg_kernels import *
 
 # Ensure Warp runtime is initialized
 wp.init()
@@ -85,7 +87,229 @@ class WarpHexapodCPGController:
         self.sub_steps = 5
         self.dt_sub = self.dt / float(self.sub_steps)
 
-        # ----------------------------------------------------------------------
-        # 6. Initialize Gait State (Deferred to set_gait analysis)
-        # ----------------------------------------------------------------------
-        # self.set_gait(gait, reset_state=True)
+        self.set_gait(gait, reset_state=True)
+
+    def set_gait(self, gait_name: str, reset_state: bool = False):
+        """
+        Switches active gait, calculates duty-factor frequencies, uploads
+        pairwise coupling rotation matrix to GPU memory, and seeds limit cycle states.
+        """
+        if gait_name not in GAIT_CONFIGS:
+            raise ValueError(f"Unknown gait '{gait_name}'. Choose from: {list(GAIT_CONFIGS.keys())}")
+
+        cfg = GAIT_CONFIGS[gait_name]
+        self.active_gait = gait_name
+        self.epsilon = float(cfg["epsilon"])
+        self.phi_phase = np.array(cfg["phases"], dtype=np.float32)
+
+        # Stance and swing phase speeds (rad/s) (Eq. 2 [3])
+        self.omega_swing = float(np.pi / ((1.0 - self.epsilon) * self.total_period))
+        self.omega_stance = float(np.pi / (self.epsilon * self.total_period))
+        self.delta_omega = self.omega_stance - self.omega_swing
+
+        # Pairwise coupling matrix: phi_ij = 2 * pi * (phi_i - phi_j)
+        phase_diff = 2.0 * np.pi * (self.phi_phase[:, None] - self.phi_phase[None, :])
+        cos_diff = np.cos(phase_diff).astype(np.float32)
+        sin_diff = np.sin(phase_diff).astype(np.float32)
+
+        # Pack (cos, sin) into a (6, 6) wp.vec2 device array
+        coupling_diff_host = np.stack([cos_diff, sin_diff], axis=-1)
+        self.coupling_diff = wp.array(
+            coupling_diff_host, 
+            dtype=wp.vec2, 
+            device=self.device
+        )
+
+        # Seed states onto limit cycle only during startup or explicit resets
+        if reset_state or not hasattr(self, 'state'):
+            theta = 2.0 * np.pi * self.phi_phase
+            x_init = (self.radius * np.cos(theta)).astype(np.float32)
+            y_init = (self.radius * np.sin(theta)).astype(np.float32)
+            state_host = np.stack([x_init, y_init], axis=-1)
+            self.state = wp.array(
+                state_host, 
+                dtype=wp.vec2, 
+                device=self.device
+            )
+
+    def step_cpg(self):
+        """
+        Executes sub-stepping Forward Euler integration on GPU device memory.
+        Utilizes double-buffered ping-pong updates across CUDA threads.
+        """
+        coupling_weight = self.coupling_strength / float(self.num_legs - 1)
+
+        for _ in range(self.sub_steps):
+            wp.launch(
+                kernel=cpg_substep_kernel,
+                dim=self.num_legs,
+                inputs=[
+                    self.state,
+                    self.state_next,
+                    self.coupling_diff,
+                    self.num_legs,
+                    self.dt_sub,
+                    self.alpha,
+                    self.mu,
+                    self.b,
+                    self.omega_swing,
+                    self.delta_omega,
+                    coupling_weight
+                ],
+                device=self.device
+            )
+            # Ping-pong buffer swap to avoid race conditions across threads
+            self.state, self.state_next = self.state_next, self.state
+
+    def map_foot_trajectory_omnidirectional(
+        self,
+        default_feet_pos_body: wp.array(dtype=wp.vec3),
+        dir_angle_rad: float = 0.0,
+        stride_forward: float = 0.01,
+        stride_lateral: float = 0.005,
+        yaw_rate: float = 0.0,
+        yaw_gain: float = 0.005,
+        ramp: float = 1.0
+    ) -> wp.array(dtype=wp.vec3):
+        """
+        Launches GPU kernel to map Hopf states into Cartesian coordinates in centroid frame.
+        Writes result directly into preallocated device buffer self.feet_pos_centroid.
+        """
+        wp.launch(
+            kernel=map_foot_trajectory_omnidirectional_kernel,
+            dim=self.num_legs,
+            inputs=[
+                self.state,
+                default_feet_pos_body,
+                self.feet_pos_centroid,
+                self.k1,
+                self.k2,
+                self.k3,
+                self.b1,
+                self.b2,
+                self.l2,
+                float(dir_angle_rad),
+                float(stride_forward),
+                float(stride_lateral),
+                float(yaw_rate),
+                float(yaw_gain),
+                float(ramp)
+            ],
+            device=self.device
+        )
+        return self.feet_pos_centroid
+
+    def inverse_kinematics(
+        self, 
+        feet_pos_local: wp.array(dtype=wp.vec3)
+    ) -> wp.array(dtype=wp.vec3):
+        """
+        Batched device wrapper launching IK evaluation across all legs in parallel.
+        Writes resulting joint angles directly into self.joint_targets_device.
+        """
+        wp.launch(
+            kernel=inverse_kinematics_kernel,
+            dim=self.num_legs,
+            inputs=[
+                feet_pos_local,
+                self.link_lengths,
+                self.joint_targets_device
+            ],
+            device=self.device
+        )
+        return self.joint_targets_device
+
+    def compute_default_feet_body(
+        self,
+        default_angles_deg: np.ndarray
+    ) -> wp.array(dtype=wp.vec3):
+        """
+        Calculates default foot positions in the centroid frame directly on GPU memory.
+        
+        Args:
+            default_angles_deg: np.ndarray of shape (3,) or (6, 3) in degrees.
+            
+        Returns:
+            wp.array(shape=6, dtype=wp.vec3): Nominal foot positions on cuda:0.
+        """
+        angles_deg = np.array(default_angles_deg, dtype=np.float32)
+        if angles_deg.ndim == 1 and angles_deg.shape[0] == 3:
+            angles_deg = np.tile(angles_deg, (self.num_legs, 1))
+
+        angles_rad_host = np.deg2rad(angles_deg).astype(np.float32)
+
+        # Stage joint angles onto GPU
+        angles_rad_device = wp.array(
+            angles_rad_host,
+            dtype=wp.vec3,
+            device=self.device
+        )
+
+        out_feet = wp.zeros(self.num_legs, dtype=wp.vec3, device=self.device)
+
+        wp.launch(
+            kernel=compute_default_feet_body_kernel,
+            dim=self.num_legs,
+            inputs=[
+                angles_rad_device,
+                self.mount_positions,
+                self.rot_z_inv,
+                self.link_lengths,
+                out_feet
+            ],
+            device=self.device
+        )
+
+        return out_feet
+
+    def compute_joint_targets(
+        self,
+        default_feet_pos_body: wp.array(dtype=wp.vec3),
+        dir_angle_rad: float = 0.0,
+        stride_forward: float = 0.01,
+        stride_lateral: float = 0.005,
+        yaw_rate: float = 0.0,
+        yaw_gain: float = 0.005,
+        ramp: float = 1.0
+    ) -> wp.array(dtype=wp.vec3):
+        """
+        Executes one control cycle on the GPU:
+        1. Steps the coupled Hopf oscillators via Forward Euler sub-stepping.
+        2. Maps limit-cycle states into Cartesian foot positions in centroid frame.
+        3. Transforms Cartesian targets into local leg frames.
+        4. Solves analytical 3-DOF inverse kinematics for all legs in parallel.
+
+        Returns:
+            wp.array(shape=6, dtype=wp.vec3): Commanded joint angles [coxa, femur, tibia] on cuda:0.
+        """
+        # 1. Step Hopf oscillator states
+        self.step_cpg()
+
+        # 2. Map oscillator phases to 3D Cartesian coordinates (Centroid Frame)
+        self.map_foot_trajectory_omnidirectional(
+            default_feet_pos_body=default_feet_pos_body,
+            dir_angle_rad=dir_angle_rad,
+            stride_forward=stride_forward,
+            stride_lateral=stride_lateral,
+            yaw_rate=yaw_rate,
+            yaw_gain=yaw_gain,
+            ramp=ramp
+        )
+
+        # 3. Transform coordinates from centroid frame to local leg base frames
+        wp.launch(
+            kernel=centroid_to_leg_frame_kernel,
+            dim=self.num_legs,
+            inputs=[
+                self.feet_pos_centroid,
+                self.mount_positions,
+                self.rot_z_inv,
+                self.feet_pos_local
+            ],
+            device=self.device
+        )
+
+        # 4. Solve analytical inverse kinematics per leg in parallel
+        self.inverse_kinematics(self.feet_pos_local)
+
+        return self.joint_targets_device

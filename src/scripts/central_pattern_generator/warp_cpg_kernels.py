@@ -1,10 +1,11 @@
+# pyright: reportInvalidTypeForm = false
 import warp as wp
 
 @wp.kernel
 def cpg_substep_kernel(
     state_in: wp.array(dtype=wp.vec2),
     state_out: wp.array(dtype=wp.vec2),
-    coupling_diff: wp.array2d(dtype=wp.vec2),
+    coupling_diff: wp.array(ndim=2, dtype=wp.vec2),
     num_legs: int,
     dt_sub: float,
     alpha: float,

@@ -68,7 +68,7 @@ from isaacsim.core.simulation_manager import SimulationManager
 import isaacsim.physics.newton as newton_ext
 
 from silver2_isaac_constants import *
-from numpy_cpg_controller import NumpyHexapodCPGController
+from warp_cpg_controller import WarpHexapodCPGController
 
 
 # Path Resolution & Simulation Parameters
@@ -191,11 +191,10 @@ def main():
 
     # Instantiate CPG Controller
     cpg_dt = SIM_DT * DECIMATION_RATIO
-    cpg_controller = NumpyHexapodCPGController(
+    cpg_controller = WarpHexapodCPGController(
         leg_mounts=SILVER2_MOUNTS,
         link_lengths=SILVER2_LINKS,
-        dt=cpg_dt,
-        gait="tripod"
+        dt=cpg_dt
     )
 
     # Dynamically-computed standing pose
@@ -203,6 +202,7 @@ def main():
     standing_targets_rad = np.deg2rad(standing_targets_deg).astype(np.float32)
     standing_targets_gpu = torch.as_tensor(standing_targets_rad, dtype=torch.float32, device=DEVICE)
     torch_standing_targets = standing_targets_gpu[canonical_to_newton].unsqueeze(0)
+    newton_targets = torch_standing_targets
 
     robot_view.set_joint_positions(torch_standing_targets)
     robot_view.set_joint_velocities(torch.zeros_like(torch_standing_targets))
@@ -216,18 +216,18 @@ def main():
     settled_q_deg = np.rad2deg(settled_q_rad).reshape((6, 3))
 
     # Compute empirical foot baseline directly from settled physics
-    calibrated_feet_body = cpg_controller.compute_default_feet_body(settled_q_deg, SILVER2_MOUNTS, SILVER2_LINKS)
+    calibrated_feet_body = cpg_controller.compute_default_feet_body(settled_q_deg)
 
     # Numpy CPG Parameters
     num_locomotion_steps = 2000
     ramp_steps = 200 
     walking_direction = SILVER2_DIRECTION_MAP["right"]
 
-    print("[INFO] Running {} settling steps...".format(num_locomotion_steps))
+    print(f"[INFO] Running {num_locomotion_steps} active locomotion steps...")
     for step in range(num_locomotion_steps):
         if step % DECIMATION_RATIO == 0:
             ramp = min(1.0, (step + 1) / ramp_steps)
-            canonical_targets = cpg_controller.compute_joint_targets(
+            warp_targets = cpg_controller.compute_joint_targets(
                 calibrated_feet_body,
                 dir_angle_rad=walking_direction,
                 stride_forward=0.005,
@@ -236,19 +236,18 @@ def main():
                 yaw_gain=0.0,
                 ramp=ramp
             )
-
-            cpg_targets_gpu = torch.as_tensor(canonical_targets.flatten(), dtype=torch.float32, device=DEVICE)
-            current_targets = cpg_targets_gpu[canonical_to_newton].unsqueeze(0)
+            torch_targets = wp.to_torch(warp_targets).reshape(-1)
+            newton_targets = torch_targets[canonical_to_newton].unsqueeze(0)
 
         # Hold targets across 420 Hz physics steps; render viewport at 60 Hz
-        robot_view.set_joint_position_targets(current_targets)
+        robot_view.set_joint_position_targets(newton_targets)
         should_render = RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0)
         world.step(render=should_render)
 
     poses, _ = robot_view.get_world_poses()
-    initial_pos = poses[0].cpu().numpy()
-    print(f"[INFO] Settled Position: X={initial_pos[0]:.3f}, Y={initial_pos[1]:.3f}, Z={initial_pos[2]:.3f} m")
-
+    final_pos = poses[0].cpu().numpy()
+    print(f"[INFO] Final Position: X={final_pos[0]:.3f}, Y={final_pos[1]:.3f}, Z={final_pos[2]:.3f} m")
+    
     world.stop()
     simulation_app.close()
 

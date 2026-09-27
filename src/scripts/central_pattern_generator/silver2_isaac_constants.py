@@ -3,6 +3,16 @@ import numpy as np
 # Link lengths: Coxa, Femur, Tibia (in meters)
 SILVER2_LINKS = (0.1068, 0.2232, 0.276)
 
+# Component mass breakdown (in kilograms)
+SILVER2_BODY_MASS = 14.78
+SILVER2_LEG_MASSES = {
+    "coxa": 0.45,
+    "femur": 0.75,
+    "tibia": 0.80,
+}
+SILVER2_SINGLE_LEG_MASS = sum(SILVER2_LEG_MASSES.values())  # 2.00 kg
+SILVER2_TOTAL_MASS = SILVER2_BODY_MASS + 6 * SILVER2_SINGLE_LEG_MASS  # 26.78 kg
+
 # Leg mount transforms in body centroid frame (X forward, Y left, Z up)
 SILVER2_MOUNTS = {
     'L0': {'pos': [0.1944,  -0.1176, -0.0336], 'yaw':  0.0},

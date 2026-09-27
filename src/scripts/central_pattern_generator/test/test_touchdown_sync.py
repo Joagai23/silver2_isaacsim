@@ -24,6 +24,9 @@ import numpy as np
 import omni
 from pxr import Usd, UsdPhysics, Gf, Sdf
 
+import warp as wp
+wp.init()
+
 DEVICE = "cuda:0"
 torch.set_default_device(DEVICE)
 
@@ -68,8 +71,12 @@ from isaacsim.core.utils.stage import get_current_stage
 from isaacsim.core.simulation_manager import SimulationManager
 import isaacsim.physics.newton as newton_ext
 
-from ..silver2_isaac_constants import *
-from ..numpy_cpg_controller import NumpyHexapodCPGController
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+from silver2_isaac_constants import *
+from warp_cpg_controller import WarpHexapodCPGController
 
 USD_PATH = "/home/jorge/Documents/Code/silver2_isaacsim/src/scenes/newton/silver2_isaac_sim_locomotion.usd"
 STAGE_NAME = "silver2_isaac_sim_locomotion.usd"
@@ -197,12 +204,13 @@ def main():
     )
 
     # Controller with verified clearance (l2 = 0.010)
-    cpg_controller = NumpyHexapodCPGController(
+    cpg_controller = WarpHexapodCPGController(
         leg_mounts=SILVER2_MOUNTS,
         link_lengths=SILVER2_LINKS,
         dt=CPG_DT,
         total_period=2.0,
-        gait="tripod"
+        gait="tripod",
+        device=DEVICE
     )
     cpg_controller.l2 = 0.010
 
@@ -224,11 +232,12 @@ def main():
     settled_q_deg = np.rad2deg(settled_q_rad).reshape((6, 3))
 
     # Compute empirical foot baseline directly from settled physics
-    calibrated_feet_body = cpg_controller.compute_default_feet_body(settled_q_deg, SILVER2_MOUNTS, SILVER2_LINKS)
+    calibrated_feet_body = cpg_controller.compute_default_feet_body(settled_q_deg)
+    calibrated_feet_np = calibrated_feet_body.numpy()
 
     print("\n[INFO] Auto-Calibrated Feet Z-Coordinates (incorporating gravity sag):")
     for i in range(6):
-        print(f"  Leg {i}: Z = {calibrated_feet_body[i, 2]:.4f} m (Nominal: {SILVER2_DEFAULT_FEET_BODY[i, 2]:.4f} m)")
+        print(f"  Leg {i}: Z = {calibrated_feet_np[i, 2]:.4f} m (Nominal: {SILVER2_DEFAULT_FEET_BODY[i, 2]:.4f} m)")
 
     # 2. Run Test 4: 3 Strides (630 CPG ticks)
     TOTAL_PERIOD = 2.0
@@ -252,21 +261,22 @@ def main():
         if step % DECIMATION == 0 and cpg_tick < NUM_CPG_TICKS:
             time_log[cpg_tick] = cpg_tick * CPG_DT
 
-            canonical_targets = cpg_controller.compute_joint_targets(
-                calibrated_feet_body,
+            warp_targets = cpg_controller.compute_joint_targets(
+                default_feet_pos_body=calibrated_feet_body,
                 dir_angle_rad=0.0,
                 stride_forward=0.005,
                 stride_lateral=0.000,
                 yaw_rate=0.0,
+                yaw_gain=0.0,
                 ramp=1.0
             )
 
-            # Store oscillator state y
-            y_state_log[cpg_tick] = cpg_controller.y.copy()
+            # Store oscillator state y from GPU memory [shape (6, 2) -> axis 1 is y]
+            y_state_log[cpg_tick] = cpg_controller.state.numpy()[:, 1]
 
-            # Stream targets
-            cpg_targets_gpu = torch.as_tensor(canonical_targets.flatten(), dtype=torch.float32, device=DEVICE)
-            current_targets = cpg_targets_gpu[canonical_to_newton].unsqueeze(0)
+            # Zero-copy view into PyTorch on cuda:0
+            torch_targets = wp.to_torch(warp_targets).reshape(-1)
+            current_targets = torch_targets[canonical_to_newton].unsqueeze(0)
 
             # Read actual joints and compute foot world Z
             curr_poses, _ = robot_view.get_world_poses()

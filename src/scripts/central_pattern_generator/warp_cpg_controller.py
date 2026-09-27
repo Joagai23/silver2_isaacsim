@@ -1,12 +1,11 @@
+# pyright: reportInvalidTypeForm = false
 import warp as wp
 import numpy as np
 from typing import Dict, Tuple, Any
-from silver2_isaac_constants import *
+from silver2_isaac_constants import GAIT_CONFIGS
 from warp_cpg_kernels import *
 
-# Ensure Warp runtime is initialized
 wp.init()
-
 
 class WarpHexapodCPGController:
     """
@@ -87,6 +86,13 @@ class WarpHexapodCPGController:
         self.sub_steps = 5
         self.dt_sub = self.dt / float(self.sub_steps)
 
+        # Preallocate Intermediate GPU Buffers
+        self.state = wp.zeros(self.num_legs, dtype=wp.vec2, device=self.device)
+        self.state_next = wp.zeros(self.num_legs, dtype=wp.vec2, device=self.device)
+        self.feet_pos_centroid = wp.zeros(self.num_legs, dtype=wp.vec3, device=self.device)
+        self.feet_pos_local = wp.zeros(self.num_legs, dtype=wp.vec3, device=self.device)
+        self.joint_targets_device = wp.zeros(self.num_legs, dtype=wp.vec3, device=self.device)
+
         self.set_gait(gait, reset_state=True)
 
     def set_gait(self, gait_name: str, reset_state: bool = False):
@@ -126,11 +132,9 @@ class WarpHexapodCPGController:
             x_init = (self.radius * np.cos(theta)).astype(np.float32)
             y_init = (self.radius * np.sin(theta)).astype(np.float32)
             state_host = np.stack([x_init, y_init], axis=-1)
-            self.state = wp.array(
-                state_host, 
-                dtype=wp.vec2, 
-                device=self.device
-            )
+
+            self.state = wp.array(state_host, dtype=wp.vec2, device=self.device)
+            self.state_next = wp.array(state_host, dtype=wp.vec2, device=self.device)
 
     def step_cpg(self):
         """
@@ -237,8 +241,6 @@ class WarpHexapodCPGController:
             angles_deg = np.tile(angles_deg, (self.num_legs, 1))
 
         angles_rad_host = np.deg2rad(angles_deg).astype(np.float32)
-
-        # Stage joint angles onto GPU
         angles_rad_device = wp.array(
             angles_rad_host,
             dtype=wp.vec3,
@@ -259,7 +261,6 @@ class WarpHexapodCPGController:
             ],
             device=self.device
         )
-
         return out_feet
 
     def compute_joint_targets(

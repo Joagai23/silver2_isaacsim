@@ -23,6 +23,8 @@ import torch
 import numpy as np
 import omni
 from pxr import Usd, UsdPhysics, Gf, Sdf
+import warp as wp
+wp.init()
 
 DEVICE = "cuda:0"
 torch.set_default_device(DEVICE)
@@ -68,9 +70,12 @@ from isaacsim.core.utils.stage import get_current_stage
 from isaacsim.core.simulation_manager import SimulationManager
 import isaacsim.physics.newton as newton_ext
 
-from ..silver2_isaac_constants import *
-from ..numpy_cpg_controller import NumpyHexapodCPGController
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
+from silver2_isaac_constants import *
+from warp_cpg_controller import WarpHexapodCPGController
 # ------------------------------------------------------------------------------
 # Simulation Parameters
 # ------------------------------------------------------------------------------
@@ -108,7 +113,6 @@ def audit_and_repair_joints(stage, robot_root_path=ROBOT_PRIM_PATH):
         rev.CreateLowerLimitAttr().Set(-180.0)
         rev.CreateUpperLimitAttr().Set(180.0)
 
-
 def setup_newton_scene(stage, physics_scene_path="/physicsScene"):
     scene_prim = stage.GetPrimAtPath(physics_scene_path)
     if not scene_prim.IsValid():
@@ -123,7 +127,6 @@ def setup_newton_scene(stage, physics_scene_path="/physicsScene"):
         scene_prim.GetAttribute("physics:engine").Set("Newton")
     else:
         scene_prim.CreateAttribute("physics:engine", Sdf.ValueTypeNames.Token).Set("Newton")
-
 
 def main():
     usd_context = omni.usd.get_context()
@@ -194,13 +197,15 @@ def main():
     )
 
     # Instantiate Controller
-    cpg_controller = NumpyHexapodCPGController(
+    cpg_controller = WarpHexapodCPGController(
         leg_mounts=SILVER2_MOUNTS,
         link_lengths=SILVER2_LINKS,
         dt=CPG_DT,
         total_period=2.0,
-        gait="tripod"
+        gait="tripod",
+        device=DEVICE
     )
+    default_feet_wp = wp.array(SILVER2_DEFAULT_FEET_BODY, dtype=wp.vec3, device=DEVICE)    
 
     # 1. Settle in Standing Posture for 100 Steps
     standing_targets_deg = np.array(SILVER2_STANDING_ANGLES_DEG, dtype=np.float32).flatten()
@@ -241,8 +246,8 @@ def main():
             time_log[cpg_tick] = cpg_tick * CPG_DT
 
             # Compute CPG targets
-            canonical_targets = cpg_controller.compute_joint_targets(
-                SILVER2_DEFAULT_FEET_BODY,
+            warp_targets = cpg_controller.compute_joint_targets(
+                default_feet_pos_body=default_feet_wp,
                 dir_angle_rad=0.0,
                 stride_forward=0.005,
                 stride_lateral=0.005,
@@ -250,12 +255,9 @@ def main():
                 yaw_gain=0.01,
                 ramp=1.0
             )
-            canonical_flat = canonical_targets.flatten()
-            target_q_log[cpg_tick] = canonical_flat
-
-            # Convert to Newton ordering
-            cpg_targets_gpu = torch.as_tensor(canonical_flat, dtype=torch.float32, device=DEVICE)
-            current_targets = cpg_targets_gpu[canonical_to_newton].unsqueeze(0)
+            torch_targets = wp.to_torch(warp_targets).reshape(-1)
+            target_q_log[cpg_tick] = torch_targets.cpu().numpy()
+            current_targets = torch_targets[canonical_to_newton].unsqueeze(0)
 
             # Sample actual joint positions (mapped back to canonical ordering)
             measured_newton_q = robot_view.get_joint_positions().squeeze()

@@ -12,7 +12,7 @@ from isaacsim.core.api.world import World
 from isaacsim.core.prims import Articulation
 from numpy_cpg_controller import NumpyHexapodCPGController
 from isaacsim.core.utils.stage import get_current_stage
-from silver2_isaac_constants import *
+from silver2_constants.isaac_constants import *
 
 # 0. Path Resolution
 USD_PATH = "/home/jorge/Documents/Code/silver2_isaacsim/src/scenes/silver2_isaac_sim_locomotion.usd"

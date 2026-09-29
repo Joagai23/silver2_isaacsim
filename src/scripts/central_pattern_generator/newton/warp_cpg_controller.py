@@ -1,8 +1,8 @@
 # pyright: reportInvalidTypeForm = false
 import warp as wp
 import numpy as np
-from typing import Dict, Tuple, Any
-from silver2_isaac_constants import GAIT_CONFIGS
+from typing import Dict, Tuple, Any, Optional
+from silver2_constants.isaac_constants import GAIT_CONFIGS
 from warp_cpg_kernels import *
 
 wp.init()
@@ -55,16 +55,8 @@ class WarpHexapodCPGController:
             ], dtype=np.float32)
 
         # Upload static geometric transforms to GPU memory
-        self.mount_positions = wp.array(
-            mount_pos_host, 
-            dtype=wp.vec3, 
-            device=self.device
-        )
-        self.rot_z_inv = wp.array(
-            rot_z_inv_host, 
-            dtype=wp.mat33, 
-            device=self.device
-        )
+        self.mount_positions = wp.array(mount_pos_host, dtype=wp.vec3, device=self.device)
+        self.rot_z_inv = wp.array(rot_z_inv_host, dtype=wp.mat33, device=self.device)
 
         # Oscillator Dynamics Hyperparameters [3]
         self.alpha = 1.0
@@ -86,12 +78,19 @@ class WarpHexapodCPGController:
         self.sub_steps = 5
         self.dt_sub = self.dt / float(self.sub_steps)
 
+        # Sensory Phase Resetting Thresholds (Calibrated for 26.78 kg)
+        self.f_touch = 15.0
+        self.f_release = 5.0
+        self.epsilon_y = 0.5
+        self.epsilon_window = 1.5
+
         # Preallocate Intermediate GPU Buffers
         self.state = wp.zeros(self.num_legs, dtype=wp.vec2, device=self.device)
         self.state_next = wp.zeros(self.num_legs, dtype=wp.vec2, device=self.device)
         self.feet_pos_centroid = wp.zeros(self.num_legs, dtype=wp.vec3, device=self.device)
         self.feet_pos_local = wp.zeros(self.num_legs, dtype=wp.vec3, device=self.device)
         self.joint_targets_device = wp.zeros(self.num_legs, dtype=wp.vec3, device=self.device)
+        self.contact_state = wp.zeros(self.num_legs, dtype=wp.int32, device=self.device)
 
         self.set_gait(gait, reset_state=True)
 
@@ -108,6 +107,21 @@ class WarpHexapodCPGController:
         self.epsilon = float(cfg["epsilon"])
         self.phi_phase = np.array(cfg["phases"], dtype=np.float32)
 
+        # Dynamic coordination groups: cluster leg indices by matching phase offsets
+        unique_phases = []
+        for phi in self.phi_phase:
+            if not any(np.isclose(phi, u, atol=1e-3) for u in unique_phases):
+                unique_phases.append(phi)
+
+        self.gait_groups = [
+            [i for i, phi in enumerate(self.phi_phase) if np.isclose(phi, u, atol=1e-3)]
+            for u in unique_phases
+        ]
+
+        print(f"[INFO] Gait '{gait_name}' loaded with {len(self.gait_groups)} dynamic coordination groups:")
+        for g_idx, group in enumerate(self.gait_groups):
+            print(f"  Group {g_idx} (phase = {unique_phases[g_idx]:.3f}): Legs {group}")
+
         # Stance and swing phase speeds (rad/s) (Eq. 2 [3])
         self.omega_swing = float(np.pi / ((1.0 - self.epsilon) * self.total_period))
         self.omega_stance = float(np.pi / (self.epsilon * self.total_period))
@@ -120,11 +134,7 @@ class WarpHexapodCPGController:
 
         # Pack (cos, sin) into a (6, 6) wp.vec2 device array
         coupling_diff_host = np.stack([cos_diff, sin_diff], axis=-1)
-        self.coupling_diff = wp.array(
-            coupling_diff_host, 
-            dtype=wp.vec2, 
-            device=self.device
-        )
+        self.coupling_diff = wp.array(coupling_diff_host, dtype=wp.vec2, device=self.device)
 
         # Seed states onto limit cycle only during startup or explicit resets
         if reset_state or not hasattr(self, 'state'):
@@ -136,11 +146,33 @@ class WarpHexapodCPGController:
             self.state = wp.array(state_host, dtype=wp.vec2, device=self.device)
             self.state_next = wp.array(state_host, dtype=wp.vec2, device=self.device)
 
-    def step_cpg(self):
+    def step_cpg(self, contact_forces: Optional[wp.array(dtype=wp.vec3)] = None):
         """
         Executes sub-stepping Forward Euler integration on GPU device memory.
         Utilizes double-buffered ping-pong updates across CUDA threads.
+        If contact_forces is supplied, applies phase resetting and enables phase freeze.
         """
+        enable_freeze = 0
+
+        if contact_forces is not None:
+            # Evaluate contacts and early touchdown resets
+            self.apply_phase_resetting(contact_forces)
+
+            # Tripod Phase Lock Enforcement
+            st_np = self.state.numpy()
+            for group in self.gait_groups:
+                if len(group) > 1:
+                    group_touched_down = any(
+                        st_np[idx, 0] >= self.radius - 0.01 and abs(st_np[idx, 1]) <= 0.1 
+                        for idx in group
+                    )
+                    if group_touched_down:
+                        for idx in group:
+                            if st_np[idx, 1] < 0.0:
+                                st_np[idx] = [self.radius, 0.0]
+
+            self.state = wp.array(st_np, dtype=wp.vec2, device=self.device)
+
         coupling_weight = self.coupling_strength / float(self.num_legs - 1)
 
         for _ in range(self.sub_steps):
@@ -151,6 +183,7 @@ class WarpHexapodCPGController:
                     self.state,
                     self.state_next,
                     self.coupling_diff,
+                    self.contact_state,
                     self.num_legs,
                     self.dt_sub,
                     self.alpha,
@@ -158,7 +191,9 @@ class WarpHexapodCPGController:
                     self.b,
                     self.omega_swing,
                     self.delta_omega,
-                    coupling_weight
+                    coupling_weight,
+                    enable_freeze,
+                    self.epsilon_window
                 ],
                 device=self.device
             )
@@ -271,7 +306,8 @@ class WarpHexapodCPGController:
         stride_lateral: float = 0.005,
         yaw_rate: float = 0.0,
         yaw_gain: float = 0.005,
-        ramp: float = 1.0
+        ramp: float = 1.0,
+        contact_forces: Optional[wp.array(dtype=wp.vec3)] = None
     ) -> wp.array(dtype=wp.vec3):
         """
         Executes one control cycle on the GPU:
@@ -284,7 +320,7 @@ class WarpHexapodCPGController:
             wp.array(shape=6, dtype=wp.vec3): Commanded joint angles [coxa, femur, tibia] on cuda:0.
         """
         # 1. Step Hopf oscillator states
-        self.step_cpg()
+        self.step_cpg(contact_forces=contact_forces)
 
         # 2. Map oscillator phases to 3D Cartesian coordinates (Centroid Frame)
         self.map_foot_trajectory_omnidirectional(
@@ -314,3 +350,23 @@ class WarpHexapodCPGController:
         self.inverse_kinematics(self.feet_pos_local)
 
         return self.joint_targets_device
+
+    def apply_phase_resetting(self, contact_forces: wp.array(dtype=wp.vec3)):
+        """
+        Executes sensory phase resetting kernel: applies Schmitt trigger
+        and projects early touchdowns onto [R, 0.0].
+        """
+        wp.launch(
+            kernel=apply_phase_resetting_kernel,
+            dim=self.num_legs,
+            inputs=[
+                self.state,
+                contact_forces,
+                self.contact_state,
+                self.radius,
+                self.f_touch,
+                self.f_release,
+                self.epsilon_y
+            ],
+            device=self.device
+        )

@@ -6,6 +6,7 @@ def cpg_substep_kernel(
     state_in: wp.array(dtype=wp.vec2),
     state_out: wp.array(dtype=wp.vec2),
     coupling_diff: wp.array(ndim=2, dtype=wp.vec2),
+    contact_state: wp.array(dtype=wp.int32),
     num_legs: int,
     dt_sub: float,
     alpha: float,
@@ -13,7 +14,9 @@ def cpg_substep_kernel(
     b: float,
     omega_swing: float,
     delta_omega: float,
-    coupling_weight: float
+    coupling_weight: float,
+    enable_phase_freeze: int,
+    epsilon_window: float
 ):
     i = wp.tid()
 
@@ -27,6 +30,15 @@ def cpg_substep_kernel(
     sig_arg = wp.clamp(b * yi, -50.0, 50.0)
     sigma = 1.0 / (1.0 + wp.exp(-sig_arg))
     omega_i = omega_swing + sigma * delta_omega
+
+    # Phase Freezing: Case B
+    gamma_i = float(1.0)
+    if enable_phase_freeze == 1:
+        c_i = contact_state[i]
+        if c_i == 0 and yi >= float(0.0) and yi <= epsilon_window:
+            gamma_i = float(0.0)
+
+    omega_eff = gamma_i * omega_i
 
     # Diffusive coupling across all peer legs (j != i)
     c_x = float(0.0)
@@ -52,9 +64,9 @@ def cpg_substep_kernel(
     coupling_x = coupling_weight * c_x
     coupling_y = coupling_weight * c_y
 
-    # Continuous Hopf nonlinear derivatives (Eq. 3 [3])
-    dx = alpha * (mu - r2) * xi - omega_i * yi + coupling_x
-    dy = alpha * (mu - r2) * yi + omega_i * xi + coupling_y
+    # Continuous Hopf nonlinear derivatives (Eq. 3 [3]) + Modulated Angular Speed
+    dx = alpha * (mu - r2) * xi - omega_eff * yi + coupling_x
+    dy = alpha * (mu - r2) * yi + omega_eff * xi + coupling_y
 
     # Forward Euler sub-step update
     state_out[i] = wp.vec2(xi + dx * dt_sub, yi + dy * dt_sub)
@@ -238,3 +250,44 @@ def centroid_to_leg_frame_kernel(
 
     # Rotate into local leg frame: p_local = R_z(-yaw) * p_rel
     feet_pos_local[i] = rot_z_inv[i] * p_rel
+
+@wp.kernel
+def apply_phase_resetting_kernel(
+    state: wp.array(dtype=wp.vec2),
+    contact_forces: wp.array(dtype=wp.vec3),
+    contact_state: wp.array(dtype=wp.int32),
+    radius: float,
+    f_touch: float,
+    f_release: float,
+    epsilon_y: float
+):
+    """
+    Evaluates Schmitt trigger contact hysteresis and performs state projection:
+    - Case A: Early touchdown -> Snaps state to [R, 0.0] on the limit cycle.
+    - Case B: Contact state update -> Controls phase freezing in ODE stepping.
+    """
+    i = wp.tid()
+
+    # Normal contact force magnitude
+    force_vec = contact_forces[i]
+    fn = wp.abs(force_vec[2])
+
+    # Schmitt Trigger Hysteresis Filter
+    prev_c = contact_state[i]
+    curr_c = prev_c
+
+    if fn >= f_touch:
+        curr_c = 1
+    elif fn <= f_release:
+        curr_c = 0
+
+    contact_state[i] = curr_c
+
+    # Read current oscillator state
+    st = state[i]
+    xi = st[0]
+    yi = st[1]
+
+    # Early Ground Contact: Case A
+    if curr_c == 1 and yi < -epsilon_y and xi > float(0.0):
+        state[i] = wp.vec2(radius, float(0.0))

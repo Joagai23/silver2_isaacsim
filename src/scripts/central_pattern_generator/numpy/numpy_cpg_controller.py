@@ -7,7 +7,7 @@ Synthesizes:
 """
 
 import numpy as np
-from silver2_isaac_constants import GAIT_CONFIGS
+from silver2_constants.isaac_constants import GAIT_CONFIGS
 
 class NumpyHexapodCPGController:
     def __init__(self, leg_mounts, link_lengths, dt=0.01, total_period=2.0, gait="tripod"):

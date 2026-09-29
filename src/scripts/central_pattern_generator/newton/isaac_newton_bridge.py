@@ -62,14 +62,13 @@ if hasattr(torch_utils, "assign"):
     torch_utils.assign = _safe_assign
 
 from isaacsim.core.api.world import World
-from isaacsim.core.prims import Articulation
+from isaacsim.core.prims import Articulation, RigidPrim
 from isaacsim.core.utils.stage import get_current_stage
 from isaacsim.core.simulation_manager import SimulationManager
 import isaacsim.physics.newton as newton_ext
 
-from silver2_isaac_constants import *
+from silver2_constants.isaac_constants import *
 from warp_cpg_controller import WarpHexapodCPGController
-
 
 # Path Resolution & Simulation Parameters
 USD_PATH = "/home/jorge/Documents/Code/silver2_isaacsim/src/scenes/newton/silver2_isaac_sim_locomotion.usd"
@@ -88,22 +87,29 @@ def audit_and_repair_joints(stage, robot_root_path=ROBOT_PRIM_PATH):
         raise RuntimeError(f"Robot root prim not found at {robot_root_path}")
     
     for prim in Usd.PrimRange(robot_prim):
-        if not prim.IsA(UsdPhysics.Joint):
-            continue
+        # Drive configuration
+        if prim.IsA(UsdPhysics.Joint):
+            joint_name = prim.GetName()
+            drive_type = "tibia" if "tibia" in joint_name else "femur" if "femur" in joint_name else "coxa"
+            cfg = DEFAULT_DRIVES[drive_type]
 
-        joint_name = prim.GetName()
-        drive_type = "tibia" if "tibia" in joint_name else "femur" if "femur" in joint_name else "coxa"
-        cfg = DEFAULT_DRIVES[drive_type]
+            drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+            drive.CreateTypeAttr().Set("force")
+            drive.CreateStiffnessAttr().Set(cfg["stiffness"])
+            drive.CreateDampingAttr().Set(cfg["damping"])
+            drive.CreateMaxForceAttr().Set(cfg["max_force"])
 
-        drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
-        drive.CreateTypeAttr().Set("force")
-        drive.CreateStiffnessAttr().Set(cfg["stiffness"])
-        drive.CreateDampingAttr().Set(cfg["damping"])
-        drive.CreateMaxForceAttr().Set(cfg["max_force"])
+            rev = UsdPhysics.RevoluteJoint(prim)
+            rev.CreateLowerLimitAttr().Set(-180.0)
+            rev.CreateUpperLimitAttr().Set(180.0)
 
-        rev = UsdPhysics.RevoluteJoint(prim)
-        rev.CreateLowerLimitAttr().Set(-180.0)
-        rev.CreateUpperLimitAttr().Set(180.0)
+        # Enable contact reporting on all Tibia links
+        if prim.HasAPI(UsdPhysics.CollisionAPI) or prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            if "tibia" in prim.GetName().lower():
+                if not prim.HasAttribute("physics:contactReport"):
+                    prim.CreateAttribute("physics:contactReport", Sdf.ValueTypeNames.Bool).Set(True)
+                else:
+                    prim.GetAttribute("physics:contactReport").Set(True)
 
 def setup_newton_scene(stage, physics_scene_path="/physicsScene"):
     """Configures USD PhysicsScene prim attributes for Newton GPU execution."""
@@ -152,6 +158,16 @@ def main():
         )
     world.initialize_physics()
 
+    # Identify Tibia prim paths
+    tibia_prim_paths = [f"{ROBOT_PRIM_PATH}/Tibia_{i}" for i in range(6)]
+    feet_view = RigidPrim(
+        prim_paths_expr=tibia_prim_paths,
+        name="silver2_feet_contact_view",
+        track_contact_forces=True,
+        prepare_contact_sensors=True
+    )
+    world.scene.add(feet_view)
+
     # Bind Articualtion
     robot_name = "SILVER2_robot"
     if world.scene.object_exists(robot_name):
@@ -170,14 +186,26 @@ def main():
 
     # Hardware Abstraction Mapping Setup
     canonical_joint_names = []
+    view_paths = feet_view.prim_paths
+    canonical_foot_indices = []
+
     for leg_idx in range(6):
         canonical_joint_names.append(f"coxa_joint_{leg_idx}")
         canonical_joint_names.append(f"femur_joint_{leg_idx}")
         canonical_joint_names.append(f"tibia_joint_{leg_idx}")
 
-    dof_names = list(robot_view.dof_names)
-    num_dofs = len(dof_names)
+        for view_idx, path in enumerate(view_paths):
+            path_lower = path.lower()
+            if f"_{leg_idx}" in path_lower or f"tibia{leg_idx}" in path_lower:
+                canonical_foot_indices.append(view_idx)
+                break
+            
+    assert len(canonical_foot_indices) == 6, (
+        f"Failed to match all 6 feet! Found {len(canonical_foot_indices)} in {view_paths}"
+    )
+    feet_to_canonical = torch.tensor(canonical_foot_indices, dtype=torch.long, device=DEVICE)
 
+    dof_names = list(robot_view.dof_names)
     canonical_to_newton = torch.tensor(
         [canonical_joint_names.index(name) for name in dof_names],
         dtype=torch.long,
@@ -189,12 +217,15 @@ def main():
         device=DEVICE
     )
 
-    # Instantiate CPG Controller
+    # Instantiate Warp CPG Controller
     cpg_dt = SIM_DT * DECIMATION_RATIO
     cpg_controller = WarpHexapodCPGController(
         leg_mounts=SILVER2_MOUNTS,
         link_lengths=SILVER2_LINKS,
-        dt=cpg_dt
+        dt=cpg_dt,
+        total_period=2.0,
+        gait="tripod",
+        device=DEVICE
     )
 
     # Dynamically-computed standing pose
@@ -207,35 +238,53 @@ def main():
     robot_view.set_joint_positions(torch_standing_targets)
     robot_view.set_joint_velocities(torch.zeros_like(torch_standing_targets))
 
+    print("[INFO] Running 1000 stance settling steps...")
     for step in range(1000):
         robot_view.set_joint_position_targets(torch_standing_targets)
         world.step(render=RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0))
 
-    # Extract true loaded joint angles (in degrees, shaped (6, 3))
+    # Extract true loaded joint angles
     settled_q_rad = robot_view.get_joint_positions().squeeze()[newton_to_canonical].cpu().numpy()
     settled_q_deg = np.rad2deg(settled_q_rad).reshape((6, 3))
 
     # Compute empirical foot baseline directly from settled physics
     calibrated_feet_body = cpg_controller.compute_default_feet_body(settled_q_deg)
 
-    # Numpy CPG Parameters
+    # Locomotion Parameters
     num_locomotion_steps = 2000
     ramp_steps = 200 
     walking_direction = SILVER2_DIRECTION_MAP["right"]
 
-    print(f"[INFO] Running {num_locomotion_steps} active locomotion steps...")
+    print(f"[INFO] Running {num_locomotion_steps} active locomotion steps with sensory phase resetting...")
     for step in range(num_locomotion_steps):
         if step % DECIMATION_RATIO == 0:
             ramp = min(1.0, (step + 1) / ramp_steps)
+
+            # Query raw contact forces from Newton GPU memory
+            raw_contact_forces = feet_view.get_net_contact_forces(clone=False)
+            if raw_contact_forces.dim() == 3:
+                raw_contact_forces = raw_contact_forces.squeeze(0)
+
+            # Convert Newton contact impulses (N*s) to continuous force (N)
+            continuous_contact_forces = raw_contact_forces / SIM_DT
+
+            # Re-order into canonical leg order and enforce contiguity
+            canonical_contact_forces = continuous_contact_forces[feet_to_canonical].contiguous()
+            contact_forces_wp = wp.from_torch(canonical_contact_forces, dtype=wp.vec3)
+
+            # Compute joint targets with closed-loop phase resetting
             warp_targets = cpg_controller.compute_joint_targets(
-                calibrated_feet_body,
+                default_feet_pos_body=calibrated_feet_body,
                 dir_angle_rad=walking_direction,
                 stride_forward=0.005,
                 stride_lateral=0.005,
                 yaw_rate=0.0,
                 yaw_gain=0.0,
-                ramp=ramp
+                ramp=ramp,
+                contact_forces=contact_forces_wp
             )
+
+            # Zero-copy view into PyTorch
             torch_targets = wp.to_torch(warp_targets).reshape(-1)
             newton_targets = torch_targets[canonical_to_newton].unsqueeze(0)
 
@@ -247,7 +296,7 @@ def main():
     poses, _ = robot_view.get_world_poses()
     final_pos = poses[0].cpu().numpy()
     print(f"[INFO] Final Position: X={final_pos[0]:.3f}, Y={final_pos[1]:.3f}, Z={final_pos[2]:.3f} m")
-    
+
     world.stop()
     simulation_app.close()
 

@@ -67,6 +67,14 @@ from isaacsim.core.utils.stage import get_current_stage
 from isaacsim.core.simulation_manager import SimulationManager
 import isaacsim.physics.newton as newton_ext
 
+import sys
+from pathlib import Path
+
+# Resolve path to 'src/scripts' (2 levels up from 'newton/')
+SCRIPTS_DIR = Path(__file__).resolve().parents[2]
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
 from silver2_constants.isaac_constants import *
 from warp_cpg_controller import WarpHexapodCPGController
 
@@ -228,6 +236,19 @@ def main():
         device=DEVICE
     )
 
+    # Update parameters to training champion
+    cpg_controller.l2 = 0.02747
+    cpg_controller.l1 = -0.00988
+    cpg_controller.k1 = 1.1701
+    cpg_controller.k2 = 0.1583
+    cpg_controller.k3 = 1.0353
+    cpg_controller.epsilon = 0.5925
+    cpg_controller.total_period = 1.6002
+    cpg_controller.coupling_strength = 0.5693
+    cpg_controller.b = 3.7180
+    cpg_controller.f_touch = 32.85
+    cpg_controller.f_release = 10.21
+
     # Dynamically-computed standing pose
     standing_targets_deg = np.array(SILVER2_STANDING_ANGLES_DEG, dtype=np.float32).flatten()
     standing_targets_rad = np.deg2rad(standing_targets_deg).astype(np.float32)
@@ -253,7 +274,7 @@ def main():
     # Locomotion Parameters
     num_locomotion_steps = 2000
     ramp_steps = 200 
-    walking_direction = SILVER2_DIRECTION_MAP["right"]
+    walking_direction = SILVER2_DIRECTION_MAP["forward"]
 
     print(f"[INFO] Running {num_locomotion_steps} active locomotion steps with sensory phase resetting...")
     for step in range(num_locomotion_steps):

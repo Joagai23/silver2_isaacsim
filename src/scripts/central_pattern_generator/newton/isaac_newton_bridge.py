@@ -237,17 +237,16 @@ def main():
     )
 
     # Update parameters to training champion
-    cpg_controller.l2 = 0.02747
-    cpg_controller.l1 = -0.00988
-    cpg_controller.k1 = 1.1701
-    cpg_controller.k2 = 0.1583
-    cpg_controller.k3 = 1.0353
-    cpg_controller.epsilon = 0.5925
-    cpg_controller.total_period = 1.6002
-    cpg_controller.coupling_strength = 0.5693
-    cpg_controller.b = 3.7180
-    cpg_controller.f_touch = 32.85
-    cpg_controller.f_release = 10.21
+    cpg_controller.l2 = 0.00359          # Peak swing lift: ~3.4 cm
+    cpg_controller.k1 = 0.63861          # Full stroke: ~12.8 cm
+    cpg_controller.k2 = 0.02678          # Stance penetration: ~0.96 mm
+    cpg_controller.k3 = 0.94882          # Swing vertical gain
+    cpg_controller.epsilon = 0.50        # Tripod duty factor
+    cpg_controller.total_period = 2.00   # Period (s)
+    cpg_controller.coupling_strength = 0.40
+    cpg_controller.b = 2.00
+    cpg_controller.f_touch = 15.00
+    cpg_controller.f_release = 5.00
 
     # Dynamically-computed standing pose
     standing_targets_deg = np.array(SILVER2_STANDING_ANGLES_DEG, dtype=np.float32).flatten()
@@ -269,7 +268,11 @@ def main():
     settled_q_deg = np.rad2deg(settled_q_rad).reshape((6, 3))
 
     # Compute empirical foot baseline directly from settled physics
-    calibrated_feet_body = cpg_controller.compute_default_feet_body(settled_q_deg)
+    calibrated_feet_body = cpg_controller.compute_default_feet_body(standing_targets_deg)
+
+    # Convert to NumPy for host-side inspection
+    calibrated_feet_np = calibrated_feet_body.numpy()
+    print("Calibrated Feet Z (m):", [round(float(calibrated_feet_np[i][2]), 4) for i in range(6)])
 
     # Locomotion Parameters
     num_locomotion_steps = 2000
@@ -297,7 +300,7 @@ def main():
             warp_targets = cpg_controller.compute_joint_targets(
                 default_feet_pos_body=calibrated_feet_body,
                 dir_angle_rad=walking_direction,
-                stride_forward=0.005,
+                stride_forward=0.010,
                 stride_lateral=0.005,
                 yaw_rate=0.0,
                 yaw_gain=0.0,

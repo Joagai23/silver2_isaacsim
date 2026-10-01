@@ -125,9 +125,18 @@ def map_foot_trajectory_omnidirectional_kernel(
 
     out_feet_pos[i] = wp.vec3(p_x, p_y, p_z)
 
+@wp.kernel
+def inverse_kinematics_kernel(
+    feet_pos_local: wp.array(dtype=wp.vec3),
+    link_lengths: wp.vec3,
+    joint_targets: wp.array(dtype=wp.vec3)
+):
+    i = wp.tid()
+    joint_targets[i] = wp_inverse_kinematics(feet_pos_local[i], link_lengths)
+
 @wp.func
 def wp_inverse_kinematics(
-    p_leg_base: wp.vec3,
+    feet_pos_local: wp.vec3,
     link_lengths: wp.vec3
 ) -> wp.vec3:
     """
@@ -141,9 +150,9 @@ def wp_inverse_kinematics(
     Returns:
         wp.vec3(theta_1, theta_2, theta_3) in radians.
     """
-    px = p_leg_base[0]
-    py = p_leg_base[1]
-    pz = p_leg_base[2]
+    px = feet_pos_local[0]
+    py = feet_pos_local[1]
+    pz = feet_pos_local[2]
 
     L1 = link_lengths[0]
     L2 = link_lengths[1]
@@ -170,15 +179,6 @@ def wp_inverse_kinematics(
     theta_2 = chord_pitch_down - psi
 
     return wp.vec3(theta_1, theta_2, theta_3)
-
-@wp.kernel
-def inverse_kinematics_kernel(
-    feet_pos_local: wp.array(dtype=wp.vec3),
-    link_lengths: wp.vec3,
-    joint_targets: wp.array(dtype=wp.vec3)
-):
-    i = wp.tid()
-    joint_targets[i] = wp_inverse_kinematics(feet_pos_local[i], link_lengths)
 
 @wp.func
 def wp_forward_kinematics(

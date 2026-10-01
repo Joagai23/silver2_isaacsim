@@ -101,9 +101,8 @@ FINAL_PT_PATH = os.path.join(RUN_DIR, "best_cpg_genome.pt")
 
 GENOME_PARAM_NAMES = [
     "l2_clearance",
-    "l1_preload",
     "k1_stride_gain",
-    "k2_splay_gain",
+    "k2_stance_gain",
     "k3_vertical_gain",
     "epsilon_duty_factor",
     "total_period_T",
@@ -142,31 +141,28 @@ def export_best_parameters(best_genome, best_fitness, total_generations, populat
         "cpg_parameters": {
             "clearance_l2_m": round(g[0], 5),
             "clearance_l2_mm": round(g[0] * 1000.0, 2),
-            "preload_offset_l1_m": round(g[1], 5),
-            "preload_offset_l1_mm": round(g[1] * 1000.0, 2),
-            "stride_gain_k1": round(g[2], 4),
-            "lateral_splay_gain_k2": round(g[3], 4),
-            "vertical_gain_k3": round(g[4], 4),
-            "duty_factor_epsilon": round(g[5], 4),
-            "gait_period_T_s": round(g[6], 3),
-            "coupling_strength_w": round(g[7], 4),
-            "sigmoid_slope_b": round(g[8], 3),
-            "touchdown_force_F_td_N": round(g[9], 2),
-            "release_force_F_rel_N": round(g[10], 2)
+            "stride_gain_k1": round(g[1], 4),
+            "stance_gain_k2": round(g[2], 4),
+            "vertical_gain_k3": round(g[3], 4),
+            "duty_factor_epsilon": round(g[4], 4),
+            "gait_period_T_s": round(g[5], 3),
+            "coupling_strength_w": round(g[6], 4),
+            "sigmoid_slope_b": round(g[7], 3),
+            "touchdown_force_F_td_N": round(g[8], 2),
+            "release_force_F_rel_N": round(g[9], 2)
         },
         "python_snippet_constants": {
             "CPG_OPTIMIZED_GAINS": {
                 "l2": round(g[0], 5),
-                "l1": round(g[1], 5),
-                "k1": round(g[2], 4),
-                "k2": round(g[3], 4),
-                "k3": round(g[4], 4),
-                "epsilon": round(g[5], 4),
-                "period": round(g[6], 3),
-                "coupling": round(g[7], 4),
-                "b": round(g[8], 3),
-                "f_touch": round(g[9], 2),
-                "f_release": round(g[10], 2)
+                "k1": round(g[1], 4),
+                "k2": round(g[2], 4),
+                "k3": round(g[3], 4),
+                "epsilon": round(g[4], 4),
+                "period": round(g[5], 3),
+                "coupling": round(g[6], 4),
+                "b": round(g[7], 3),
+                "f_touch": round(g[8], 2),
+                "f_release": round(g[9], 2)
             }
         }
     }
@@ -301,8 +297,6 @@ def main():
         joint_kps = torch.full((num_envs, 18), 120.0, device=DEVICE)
         joint_kds = torch.full((num_envs, 18), 5.0, device=DEVICE)
 
-    MAX_JOINT_TORQUE = 60.0  # N*m (SILVER2 peak drive saturation limit)
-
     # 5. Joint & Foot Hardware Mappings
     canonical_joint_names = []
     for leg_idx in range(6):
@@ -374,7 +368,7 @@ def main():
     default_root_rot = default_root_rot.clone()
 
     settled_q = robot_view.get_joint_positions()[:, newton_to_canonical].cpu().numpy()
-    angles_rad = np.deg2rad(np.rad2deg(settled_q[0]).reshape(6, 3)).astype(np.float32)
+    angles_rad = np.deg2rad(np.array(SILVER2_STANDING_ANGLES_DEG, dtype=np.float32))
     default_feet_body_host = np.zeros((6, 3), dtype=np.float32)
     for i in range(6):
         q1, q2, q3 = angles_rad[i]
@@ -394,37 +388,36 @@ def main():
     default_feet_body_wp = wp.array(default_feet_body_host, dtype=wp.vec3, device=DEVICE)
 
     # --------------------------------------------------------------------------
-    # 7. Evolutionary Optimization (11 Parameters)
-    # Genome: [l2, l1, k1, k2, k3, epsilon, total_period, coupling_strength, b, f_touch, f_release]
+    # 7. Evolutionary Optimization (10 Parameters)
+    # Genome: [l2, k1, k2, k3, epsilon, total_period, coupling_strength, b, f_touch, f_release]
     # --------------------------------------------------------------------------
-    GENOME_MIN = torch.tensor([0.005, -0.025, 0.50, 0.00, 0.50, 0.50, 1.00, 0.05, 1.0, 15.0, 2.0], device=DEVICE)
-    GENOME_MAX = torch.tensor([0.045,  0.000, 1.60, 0.40, 1.60, 0.70, 2.50, 0.80, 5.0, 50.0, 15.0], device=DEVICE)
+    GENOME_MIN = torch.tensor([0.001, 0.50, 0.00, 0.85, 0.50, 1.20, 0.10, 1.5, 15.0, 2.0], device=DEVICE)
+    GENOME_MAX = torch.tensor([0.010, 1.00, 0.10, 1.05, 0.72, 2.50, 0.80, 5.0, 50.0, 15.0], device=DEVICE)
 
     CURRICULUM_MASKS = {
-        # Stage 1: Spatial footprint & stroke [l2, l1, k1, k2, k3]
+        # Stage 1: Spatial footprint & stroke [l2, k1, k2, k3]
         "stage1_spatial": torch.tensor(
-            [True, True, True, True, True, False, False, False, False, False, False],
+            [True, True, True, True, False, False, False, False, False, False],
             dtype=torch.bool, device=DEVICE
         ),
         # Stage 2: Oscillator cadence & gait rhythm [epsilon, T, w, b]
         "stage2_temporal": torch.tensor(
-            [False, False, False, False, False, True, True, True, True, False, False],
+            [False, False, False, False, True, True, True, True, False, False],
             dtype=torch.bool, device=DEVICE
         ),
         # Stage 3: Force thresholds for contact reflexes [F_td, F_rel]
         "stage3_sensory": torch.tensor(
-            [False, False, False, False, False, False, False, False, False, True, True],
+            [False, False, False, False, False, False, False, False, True, True],
             dtype=torch.bool, device=DEVICE
         ),
     }
 
     # Reference baseline genome (used to hold inactive stages static)
     BASELINE_GENOME = torch.tensor([
-        0.01,   # l2 (m)
-        -0.01,  # l1 (m)
-        1.00,   # k1
-        0.00,   # k2
-        1.00,   # k3
+        0.010,   # l2 (m)
+        1.000,   # k1
+        0.000,   # k2
+        1.000,   # k3
         0.50,   # epsilon
         2.00,   # period T (s)
         0.40,   # coupling w
@@ -438,18 +431,18 @@ def main():
     active_mask = CURRICULUM_MASKS[ACTIVE_STAGE]
     frozen_mask = ~active_mask
 
-    # Broadcast baseline across entire population [num_envs, 11]
+    # Broadcast baseline across entire population [num_envs, 10]
     population = BASELINE_GENOME.repeat(num_envs, 1)
 
     # Randomize only active parameters within their respective bounds
-    random_active = GENOME_MIN + torch.rand((num_envs, 11), device=DEVICE) * (GENOME_MAX - GENOME_MIN)
+    random_active = GENOME_MIN + torch.rand((num_envs, 10), device=DEVICE) * (GENOME_MAX - GENOME_MIN)
     population = torch.where(active_mask.unsqueeze(0), random_active, population)
 
     # Seed Individual 0 with the baseline (or previous stage champion)
     population[0] = BASELINE_GENOME.clone()
     cpg_controller.set_population_genomes(population)
 
-    NUM_GENERATIONS = 50
+    NUM_GENERATIONS = 100
     STEPS_PER_EVAL = 1500
 
     best_overall_fitness = -float("inf")
@@ -483,13 +476,14 @@ def main():
                 if raw_forces.dim() == 3:
                     raw_forces = raw_forces.squeeze(0)
 
-                canonical_forces = raw_forces[feet_to_canonical].contiguous()
+                continuous_forces = raw_forces / SIM_DT
+                canonical_forces = continuous_forces[feet_to_canonical].contiguous()
                 contact_forces_wp = wp.from_torch(canonical_forces, dtype=wp.vec3)
 
                 warp_targets = cpg_controller.compute_joint_targets_vec(
                     default_feet_pos_body=default_feet_body_wp,
                     dir_angle_rad=0.0,
-                    stride_forward=0.005,
+                    stride_forward=0.01,
                     stride_lateral=0.005,
                     ramp=ramp,
                     contact_forces=contact_forces_wp
@@ -497,86 +491,68 @@ def main():
 
                 torch_targets = wp.to_torch(warp_targets).reshape(num_envs, 18)
                 newton_targets = torch_targets[:, canonical_to_newton]
+                robot_view.set_joint_position_targets(newton_targets)
 
-                # Accumulate mechanical work
-                q_curr = robot_view.get_joint_positions(clone=False)
-                q_vels = robot_view.get_joint_velocities(clone=False)
-
-                # Attempt native applied efforts; fall back to analytical PD drive torque
-                tau_efforts = None
-                if hasattr(robot_view, "get_applied_joint_efforts"):
-                    try:
-                        tau_efforts = robot_view.get_applied_joint_efforts(clone=False)
-                    except Exception:
-                        tau_efforts = None
-
-                if tau_efforts is None or tau_efforts.abs().sum() == 0:
-                    # Analytical motor effort: tau = clamp(Kp*(q_des - q) - Kd*q_dot, -tau_max, tau_max)
-                    tau_efforts = torch.clamp(
-                        joint_kps * (newton_targets - q_curr) - joint_kds * q_vels,
-                        -MAX_JOINT_TORQUE,
-                        MAX_JOINT_TORQUE
-                    )
-
-                # Instantaneous mechanical power: P = sum(|tau * q_dot|) (Watts)
-                step_power = torch.sum(torch.abs(tau_efforts * q_vels), dim=-1)
-                
-                # Integrate energy: dE = P * dt (Joules)
-                dt_step = DECIMATION * SIM_DT
-                total_energy += step_power * dt_step
-
-                if step >= 40:
-                    fn_mags = torch.norm(canonical_forces.reshape(num_envs, 6, 3), dim=-1)
-                    peak_impact_forces = torch.maximum(peak_impact_forces, fn_mags.max(dim=1).values)
-
-            robot_view.set_joint_position_targets(newton_targets)
+            # Step the dynamic physics engine
             world.step(render=False)
 
+            # Continuous measurement: track forces and work on EVERY physics step
+            q_curr = robot_view.get_joint_positions(clone=False)
+            q_vels = robot_view.get_joint_velocities(clone=False)
+
+            # True closed-loop PD torque after physics response
+            tau_efforts = torch.clamp(
+                joint_kps * (newton_targets - q_curr) - joint_kds * q_vels,
+                -MAX_TORQUE,
+                MAX_TORQUE
+            )
+
+            # Continuous energy integration: dE = P * SIM_DT
+            step_power = torch.sum(torch.abs(tau_efforts * q_vels), dim=-1)
+            total_energy += step_power * SIM_DT
+
+            # Continuous peak ground impact capture (never misses touchdown transients)
+            if step >= 40:
+                all_forces = feet_view.get_net_contact_forces(clone=False)
+                if all_forces.dim() == 3:
+                    all_forces = all_forces.squeeze(0)
+                continuous_all = all_forces / SIM_DT
+                cf = continuous_all[feet_to_canonical]
+                fn_mags = torch.norm(cf.reshape(num_envs, 6, 3), dim=-1)
+                peak_impact_forces = torch.maximum(peak_impact_forces, fn_mags.max(dim=1).values)
+
         # 3. Multi-Objective Scale-Aligned Fitness Evaluation
-        end_poses, end_quats = robot_view.get_world_poses()
+        end_poses, _ = robot_view.get_world_poses()
         forward_displacement = end_poses[:, 0] - start_pos[:, 0]
         lateral_drift = torch.abs(end_poses[:, 1] - start_pos[:, 1])
 
-        # Compute chassis tilt penalty from base quaternion (w, x, y, z)
-        # Up-vector projection on global Z axis: R_33 = 1 - 2*(x^2 + y^2)
-        tilt_deviation = 2.0 * (end_quats[:, 1]**2 + end_quats[:, 2]**2)  # 0 when upright, >0 when pitched/rolled
-        tilt_penalty = torch.clamp(tilt_deviation * 10.0, max=5.0)
-
-        # Impact penalty based on true physical Newtons (nominal threshold 350 N)
-        excess_force = torch.clamp(peak_impact_forces - 350.0, min=0.0)
-        impact_penalty = torch.clamp(excess_force / 50.0, max=5.0)
-
-        # Cost of transport
-        safe_distance = torch.clamp(forward_displacement, min=0.05)
-        cost_of_transport = total_energy / (robot_weight_n * safe_distance)
-        # Penalty: Baseline smooth walking is ~1.5 - 3.5; hopping spikes to > 8.0
-        cot_excess = torch.clamp(cost_of_transport - 2.5, min=0.0)
-        cot_penalty = torch.clamp(cot_excess * 1.5, max=10.0)
-        """
-        # Total fitness score
-        fitness = (
-            forward_displacement * 10.0   # Dominant drive: 3 m -> +30 pts
-            - lateral_drift * 5.0          # Drift penalty
-            - tilt_penalty                 # Chassis stability penalty (max -5 pts)
-            - impact_penalty              # Ground collision penalty (max -5 pts)
-        )
-        """
-
-        # Stage 1 Fitness
         eval_time_s = STEPS_PER_EVAL * SIM_DT
-        # Forward velocity in m/s
         v_forward = forward_displacement / eval_time_s
-        # Straightness: ratio of lateral drift to forward progress (bounded)
-        safe_fwd = torch.clamp(forward_displacement, min=0.10)
+
+        safe_fwd = torch.clamp(forward_displacement, min=0.05)
         drift_ratio = torch.clamp(lateral_drift / safe_fwd, max=2.0)
-        # Dimensionless Cost of Transport
         cost_of_transport = total_energy / (robot_weight_n * safe_fwd)
-        # Bounded Stage 1 fitness (Clean magnitude: nominal ~0.0 to 1.0)
-        fitness = (
-            v_forward              # Direct forward speed (0.5 to 1.2 pts)
-            - 0.5 * drift_ratio    # Drift penalty (0.0 straight, up to -1.0)
-            - 0.1 * cost_of_transport # Energy efficiency penalty (~ -0.2 to -0.4 for good walks)
-        )
+
+        # 1. Kinematically bounded forward speed (max +1.2 pts at 0.12 m/s)
+        speed_reward = 10.0 * torch.clamp(v_forward, max=0.12)
+
+        # 2. Heading alignment (straight = 0.0, heavy drift = up to -0.6 pts)
+        drift_penalty = 0.3 * drift_ratio
+
+        # 3. CoT penalty: scalable deduction that suppresses 6 kW power bursts
+        cot_excess = torch.clamp(cost_of_transport - 3.0, min=0.0)
+        cot_penalty = torch.clamp(cot_excess * 0.08, max=8.0)
+
+        # 4. Anti-bounding ground impact penalty (punishes kicks > 350 N)
+        excess_force = torch.clamp(peak_impact_forces - 350.0, min=0.0)
+        impact_penalty = torch.clamp(excess_force / 100.0, max=5.0)
+
+        # 5. Anti-stall penalty (< 15 cm progress)
+        stall_mask = (forward_displacement < 0.15).float()
+        stall_penalty = stall_mask * 2.0
+
+        # Calibrated Stage 1 Fitness
+        fitness = speed_reward - drift_penalty - cot_penalty - impact_penalty - stall_penalty
 
         best_gen_idx = torch.argmax(fitness).item()
         best_gen_fitness = fitness[best_gen_idx].item()
@@ -619,7 +595,7 @@ def main():
         )
 
         # 6. Selection, Crossover & Mutation for Next Generation
-        k_elites = 8
+        k_elites = 2
         _, elite_indices = torch.topk(fitness, k=k_elites)
         elites = population[elite_indices].clone()
 
@@ -634,13 +610,13 @@ def main():
 
         # Per-Gene BLX-alpha (alpha=0.15)
         num_genes = population.shape[1]
-        blend_weights = torch.rand((num_envs, num_genes), device=DEVICE) * 1.3 - 0.15
+        blend_weights = torch.rand((num_envs, num_genes), device=DEVICE) * 1.4 - 0.20
         crossed_offspring = blend_weights * parent_a + (1.0 - blend_weights) * parent_b
 
         offspring = torch.where(active_mask.unsqueeze(0), crossed_offspring, BASELINE_GENOME.unsqueeze(0))
 
         # Annealed mutation rate with exploration floor
-        mutation_rate = max(0.02, 0.12 * (1.0 - (gen + 1) / NUM_GENERATIONS))
+        mutation_rate = max(0.03, 0.12 * (1.0 - (gen + 1) / NUM_GENERATIONS))
         raw_noise = torch.randn_like(offspring) * (GENOME_MAX - GENOME_MIN) * mutation_rate
 
         # Zero out mutation noise for all frozen parameters

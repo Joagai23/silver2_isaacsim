@@ -14,7 +14,7 @@ class VectorizedWarpHexapodCPGController:
         num_envs: int,
         leg_mounts: Dict[str, Dict[str, Any]],
         link_lengths: Tuple[float, float, float],
-        dt: float = 0.0095,
+        dt: float = 0.01,
         gait: str = "tripod",
         device: str = "cuda:0"
     ):
@@ -56,6 +56,10 @@ class VectorizedWarpHexapodCPGController:
         self.sub_steps = 5
         self.dt_sub = self.dt / float(self.sub_steps)
 
+        # Sensory phase reflex toggles
+        self.enable_phase_freeze = 0
+        self.epsilon_window = 0.25
+
         # 3. Canonical Coupling Matrix
         cfg = GAIT_CONFIGS[gait]
         self.phi_phase = np.array(cfg["phases"], dtype=np.float32)
@@ -85,7 +89,8 @@ class VectorizedWarpHexapodCPGController:
 
         # 5. Preallocated Vectorized Genome Arrays (Length = num_envs)
         self.l2_vec = wp.zeros(self.num_envs, dtype=wp.float32, device=self.device)
-        self.l1_vec = wp.zeros(self.num_envs, dtype=wp.float32, device=self.device)
+        self.b1_vec = wp.zeros(self.num_envs, dtype=wp.float32, device=self.device)
+        self.b2_vec = wp.zeros(self.num_envs, dtype=wp.float32, device=self.device)
         self.k1_vec = wp.zeros(self.num_envs, dtype=wp.float32, device=self.device)
         self.k2_vec = wp.zeros(self.num_envs, dtype=wp.float32, device=self.device)
         self.k3_vec = wp.zeros(self.num_envs, dtype=wp.float32, device=self.device)
@@ -103,8 +108,8 @@ class VectorizedWarpHexapodCPGController:
         theta = 2.0 * np.pi * self.phi_phase
         x_single = (self.radius * np.cos(theta)).astype(np.float32)
         y_single = (self.radius * np.sin(theta)).astype(np.float32)
-        state_single = np.stack([x_single, y_single], axis=-1)  # (6, 2)
-        state_pop = np.tile(state_single, (self.num_envs, 1))   # (num_envs * 6, 2)
+        state_single = np.stack([x_single, y_single], axis=-1)
+        state_pop = np.tile(state_single, (self.num_envs, 1))
 
         self.state = wp.array(state_pop, dtype=wp.vec2, device=self.device)
         self.state_next = wp.array(state_pop, dtype=wp.vec2, device=self.device)
@@ -112,22 +117,21 @@ class VectorizedWarpHexapodCPGController:
 
     def set_population_genomes(self, genomes_torch: torch.Tensor):
         """
-        Ingests population genome tensor (shape: [num_envs, 11]) on cuda:0 zero-copy:
-        [l2, l1, k1, k2, k3, epsilon, total_period, coupling_strength, b, f_touch, f_release]
+        Ingests population genome tensor (shape: [num_envs, 10]) on cuda:0 zero-copy:
+        [l2, k1, k2, k3, epsilon, total_period, coupling_strength, b, f_touch, f_release]
         """
-        assert genomes_torch.shape == (self.num_envs, 11), "Invalid genome tensor shape"
+        assert genomes_torch.shape == (self.num_envs, 10), "Invalid genome tensor shape"
 
         l2 = genomes_torch[:, 0].contiguous()
-        l1 = genomes_torch[:, 1].contiguous()
-        k1 = genomes_torch[:, 2].contiguous()
-        k2 = genomes_torch[:, 3].contiguous()
-        k3 = genomes_torch[:, 4].contiguous()
-        epsilon = genomes_torch[:, 5].contiguous()
-        period = genomes_torch[:, 6].contiguous()
-        coupling = genomes_torch[:, 7].contiguous()
-        b = genomes_torch[:, 8].contiguous()
-        f_touch = genomes_torch[:, 9].contiguous()
-        f_release = genomes_torch[:, 10].contiguous()
+        k1 = genomes_torch[:, 1].contiguous()
+        k2 = genomes_torch[:, 2].contiguous()
+        k3 = genomes_torch[:, 3].contiguous()
+        epsilon = genomes_torch[:, 4].contiguous()
+        period = genomes_torch[:, 5].contiguous()
+        coupling = genomes_torch[:, 6].contiguous()
+        b = genomes_torch[:, 7].contiguous()
+        f_touch = genomes_torch[:, 8].contiguous()
+        f_release = genomes_torch[:, 9].contiguous()
 
         # Compute dynamic frequencies
         omega_swing = torch.pi / ((1.0 - epsilon) * period)
@@ -137,7 +141,8 @@ class VectorizedWarpHexapodCPGController:
 
         # Zero-copy views into Warp arrays
         self.l2_vec = wp.from_torch(l2, dtype=wp.float32)
-        self.l1_vec = wp.from_torch(l1, dtype=wp.float32)
+        self.b1_vec = wp.zeros(self.num_envs, dtype=wp.float32, device=self.device)
+        self.b2_vec = wp.zeros(self.num_envs, dtype=wp.float32, device=self.device)
         self.k1_vec = wp.from_torch(k1, dtype=wp.float32)
         self.k2_vec = wp.from_torch(k2, dtype=wp.float32)
         self.k3_vec = wp.from_torch(k3, dtype=wp.float32)
@@ -152,14 +157,14 @@ class VectorizedWarpHexapodCPGController:
         self,
         default_feet_pos_body: wp.array(dtype=wp.vec3),
         dir_angle_rad: float = 0.0,
-        stride_forward: float = 0.005,
+        stride_forward: float = 0.01,
         stride_lateral: float = 0.005,
         yaw_rate: float = 0.0,
         yaw_gain: float = 0.0,
         ramp: float = 1.0,
         contact_forces: Optional[wp.array(dtype=wp.vec3)] = None
     ) -> wp.array(dtype=wp.vec3):
-        # 1. Sensory Phase Resetting
+        # 1. Sensory Phase Resetting (Case A)
         if contact_forces is not None:
             wp.launch(
                 kernel=apply_phase_resetting_kernel_vec,
@@ -184,7 +189,8 @@ class VectorizedWarpHexapodCPGController:
                     group_x = st_torch[:, group, 0]
                     group_y = st_torch[:, group, 1]
                     # Mask of envs where at least one leg in group triggered touchdown
-                    triggered_envs = (group_x >= self.radius - 0.01).any(dim=1) & (group_y.abs() <= 0.1).any(dim=1)
+                    is_touchdown = (group_x >= (self.radius - 0.01)) & (group_y.abs() <= 0.1)
+                    triggered_envs = is_touchdown.any(dim=1)
                     if triggered_envs.any():
                         # For those envs, snap all group legs still in swing (y < 0) to [R, 0]
                         for leg_idx in group:
@@ -201,6 +207,7 @@ class VectorizedWarpHexapodCPGController:
                     self.state,
                     self.state_next,
                     self.coupling_diff,
+                    self.contact_state,
                     self.num_legs,
                     self.dt_sub,
                     self.alpha,
@@ -208,7 +215,9 @@ class VectorizedWarpHexapodCPGController:
                     self.b_vec,
                     self.omega_swing_vec,
                     self.delta_omega_vec,
-                    self.coupling_weight_vec
+                    self.coupling_weight_vec,
+                    self.enable_phase_freeze,
+                    self.epsilon_window
                 ],
                 device=self.device
             )
@@ -225,7 +234,8 @@ class VectorizedWarpHexapodCPGController:
                 self.k1_vec,
                 self.k2_vec,
                 self.k3_vec,
-                self.l1_vec,
+                self.b1_vec,
+                self.b2_vec,
                 self.l2_vec,
                 float(dir_angle_rad),
                 float(stride_forward),

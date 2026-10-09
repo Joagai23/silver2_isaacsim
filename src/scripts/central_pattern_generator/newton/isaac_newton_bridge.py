@@ -237,16 +237,31 @@ def main():
     )
 
     # Update parameters to training champion
-    cpg_controller.l2 = 0.00359          # Peak swing lift: ~3.4 cm
-    cpg_controller.k1 = 0.63861          # Full stroke: ~12.8 cm
-    cpg_controller.k2 = 0.02678          # Stance penetration: ~0.96 mm
-    cpg_controller.k3 = 0.94882          # Swing vertical gain
-    cpg_controller.epsilon = 0.50        # Tripod duty factor
-    cpg_controller.total_period = 2.00   # Period (s)
-    cpg_controller.coupling_strength = 0.40
-    cpg_controller.b = 2.00
-    cpg_controller.f_touch = 15.00
-    cpg_controller.f_release = 5.00
+    # Phase 4 Champion
+    """
+    cpg_controller.l2 = 0.00247
+    cpg_controller.k1 = 0.5812
+    cpg_controller.k2 = 0.0453
+    cpg_controller.k3 = 1.0500
+    cpg_controller.epsilon = 0.537
+    cpg_controller.total_period = 2.004
+    cpg_controller.coupling_strength = 0.269
+    cpg_controller.b = 3.971
+    cpg_controller.f_touch = 33.22
+    cpg_controller.f_release = 8.97
+    """
+
+    # Final Champion Gait Controller
+    cpg_controller.l2 = 0.00234
+    cpg_controller.k1 = 0.60048
+    cpg_controller.k2 = 0.04637
+    cpg_controller.k3 = 1.02018
+    cpg_controller.epsilon = 0.54614
+    cpg_controller.total_period = 1.99208
+    cpg_controller.coupling_strength = 0.27967
+    cpg_controller.b = 3.80590
+    cpg_controller.f_touch = 33.75
+    cpg_controller.f_release = 10.13
 
     # Dynamically-computed standing pose
     standing_targets_deg = np.array(SILVER2_STANDING_ANGLES_DEG, dtype=np.float32).flatten()
@@ -258,8 +273,8 @@ def main():
     robot_view.set_joint_positions(torch_standing_targets)
     robot_view.set_joint_velocities(torch.zeros_like(torch_standing_targets))
 
-    print("[INFO] Running 1000 stance settling steps...")
-    for step in range(1000):
+    print("[INFO] Running 500 stance settling steps...")
+    for step in range(500):
         robot_view.set_joint_position_targets(torch_standing_targets)
         world.step(render=RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0))
 
@@ -275,7 +290,7 @@ def main():
     print("Calibrated Feet Z (m):", [round(float(calibrated_feet_np[i][2]), 4) for i in range(6)])
 
     # Locomotion Parameters
-    num_locomotion_steps = 2000
+    num_locomotion_steps = 1500
     ramp_steps = 200 
     walking_direction = SILVER2_DIRECTION_MAP["forward"]
 

@@ -87,6 +87,13 @@ SIM_DT = 1 / 420.0
 RENDER_FPS = 60.0
 RENDER_INTERVAL = int(round((1.0 / RENDER_FPS) / SIM_DT))
 DECIMATION_RATIO = 4
+CPG_DT = SIM_DT * DECIMATION_RATIO
+
+STRIDE_FWD_CMD = 0.010
+STRIDE_LAT_CMD = 0.005 
+TEST_DURATION_S = 6.0
+NUM_LOCOMOTION_STEPS = int(round(TEST_DURATION_S / SIM_DT))
+RAMP_STEPS = 200
 
 def audit_and_repair_joints(stage, robot_root_path=ROBOT_PRIM_PATH):
     """Explicit UsdPhysics.DriveAPI properties for all joints in the Hexapod Robot."""
@@ -113,7 +120,8 @@ def audit_and_repair_joints(stage, robot_root_path=ROBOT_PRIM_PATH):
 
         # Enable contact reporting on all Tibia links
         if prim.HasAPI(UsdPhysics.CollisionAPI) or prim.HasAPI(UsdPhysics.RigidBodyAPI):
-            if "tibia" in prim.GetName().lower():
+            prim_name = prim.GetName().lower()
+            if "tibia" in prim_name or "foot" in prim_name:
                 if not prim.HasAttribute("physics:contactReport"):
                     prim.CreateAttribute("physics:contactReport", Sdf.ValueTypeNames.Bool).Set(True)
                 else:
@@ -136,10 +144,8 @@ def setup_newton_scene(stage, physics_scene_path="/physicsScene"):
         scene_prim.CreateAttribute("physics:engine", Sdf.ValueTypeNames.Token).Set("Newton")
         
 def main():
-    # Stage Init.
     usd_context = omni.usd.get_context()
     current_stage_url = usd_context.get_stage_url() or ""
-
     if STAGE_NAME not in current_stage_url:
         print(f"[INFO] Loading stage into Newton environment: {USD_PATH}")
         usd_context.open_stage(USD_PATH)
@@ -149,11 +155,6 @@ def main():
     setup_newton_scene(stage, "/physicsScene")
     SimulationManager.switch_physics_engine("newton")
 
-    ns = newton_ext.acquire_stage()
-    if ns is not None:
-        ns.cfg.solver_cfg.nconmax = 1000
-
-    # World Init.
     world = World.instance()
     if world is None:
         world = World(
@@ -165,6 +166,16 @@ def main():
             device=DEVICE
         )
     world.initialize_physics()
+
+    ns = newton_ext.acquire_stage()
+    if ns is not None:
+        ns.cfg.solver_cfg.nconmax = 1000
+        ns.cfg.solver_cfg.njmax = 1200
+        # Increase iteration budget if exposed in your Newton build:
+        if hasattr(ns.cfg.solver_cfg, "num_iterations"):
+            ns.cfg.solver_cfg.num_iterations = 64
+        if hasattr(ns.cfg.solver_cfg, "num_ls_iterations"):
+            ns.cfg.solver_cfg.num_ls_iterations = 15
 
     # Identify Tibia prim paths
     tibia_prim_paths = [f"{ROBOT_PRIM_PATH}/Tibia_{i}" for i in range(6)]
@@ -226,49 +237,20 @@ def main():
     )
 
     # Instantiate Warp CPG Controller
-    cpg_dt = SIM_DT * DECIMATION_RATIO
     cpg_controller = WarpHexapodCPGController(
         leg_mounts=SILVER2_MOUNTS,
         link_lengths=SILVER2_LINKS,
-        dt=cpg_dt,
+        dt=CPG_DT,
         total_period=2.0,
         gait="tripod",
         device=DEVICE
     )
-
-    # Update parameters to training champion
-    # Phase 4 Champion
-    """
-    cpg_controller.l2 = 0.00247
-    cpg_controller.k1 = 0.5812
-    cpg_controller.k2 = 0.0453
-    cpg_controller.k3 = 1.0500
-    cpg_controller.epsilon = 0.537
-    cpg_controller.total_period = 2.004
-    cpg_controller.coupling_strength = 0.269
-    cpg_controller.b = 3.971
-    cpg_controller.f_touch = 33.22
-    cpg_controller.f_release = 8.97
-    """
-
-    # Final Champion Gait Controller
-    cpg_controller.l2 = 0.00234
-    cpg_controller.k1 = 0.60048
-    cpg_controller.k2 = 0.04637
-    cpg_controller.k3 = 1.02018
-    cpg_controller.epsilon = 0.54614
-    cpg_controller.total_period = 1.99208
-    cpg_controller.coupling_strength = 0.27967
-    cpg_controller.b = 3.80590
-    cpg_controller.f_touch = 33.75
-    cpg_controller.f_release = 10.13
-
+    
     # Dynamically-computed standing pose
     standing_targets_deg = np.array(SILVER2_STANDING_ANGLES_DEG, dtype=np.float32).flatten()
     standing_targets_rad = np.deg2rad(standing_targets_deg).astype(np.float32)
     standing_targets_gpu = torch.as_tensor(standing_targets_rad, dtype=torch.float32, device=DEVICE)
     torch_standing_targets = standing_targets_gpu[canonical_to_newton].unsqueeze(0)
-    newton_targets = torch_standing_targets
 
     robot_view.set_joint_positions(torch_standing_targets)
     robot_view.set_joint_velocities(torch.zeros_like(torch_standing_targets))
@@ -283,58 +265,93 @@ def main():
     settled_q_deg = np.rad2deg(settled_q_rad).reshape((6, 3))
 
     # Compute empirical foot baseline directly from settled physics
-    calibrated_feet_body = cpg_controller.compute_default_feet_body(standing_targets_deg)
+    calibrated_feet_body = cpg_controller.compute_default_feet_body(settled_q_deg)
 
     # Convert to NumPy for host-side inspection
     calibrated_feet_np = calibrated_feet_body.numpy()
     print("Calibrated Feet Z (m):", [round(float(calibrated_feet_np[i][2]), 4) for i in range(6)])
 
-    # Locomotion Parameters
-    num_locomotion_steps = 1500
-    ramp_steps = 200 
     walking_direction = SILVER2_DIRECTION_MAP["forward"]
 
-    print(f"[INFO] Running {num_locomotion_steps} active locomotion steps with sensory phase resetting...")
-    for step in range(num_locomotion_steps):
+    root_poses, _ = robot_view.get_world_poses()
+    start_pos = root_poses[0].clone()
+    peak_impact_n = 0.0
+    tilt_samples = []
+
+    # Filter buffers (6 feet, 3 axes)
+    accumulated_forces = torch.zeros((6, 3), device=DEVICE)
+    filtered_forces = torch.zeros((6, 3), device=DEVICE)
+
+    print(f"[INFO] Running {NUM_LOCOMOTION_STEPS} active locomotion steps with sensory phase resetting...")
+    for step in range(NUM_LOCOMOTION_STEPS):
+        # A. CPG Control Step (Decimated)
         if step % DECIMATION_RATIO == 0:
-            ramp = min(1.0, (step + 1) / ramp_steps)
+            ramp = min(1.0, (step + 1) / float(RAMP_STEPS))
 
-            # Query raw contact forces from Newton GPU memory
-            raw_contact_forces = feet_view.get_net_contact_forces(clone=False)
-            if raw_contact_forces.dim() == 3:
-                raw_contact_forces = raw_contact_forces.squeeze(0)
+            # Apply moving average filter across sub-steps
+            if step > 0:
+                mean_forces = accumulated_forces / float(DECIMATION_RATIO)
+                accumulated_forces.zero_()
+                filtered_forces = 0.7 * filtered_forces + 0.3 * mean_forces[feet_to_canonical]
 
-            # Convert Newton contact impulses (N*s) to continuous force (N)
-            continuous_contact_forces = raw_contact_forces / SIM_DT
-
-            # Re-order into canonical leg order and enforce contiguity
-            canonical_contact_forces = continuous_contact_forces[feet_to_canonical].contiguous()
-            contact_forces_wp = wp.from_torch(canonical_contact_forces, dtype=wp.vec3)
-
-            # Compute joint targets with closed-loop phase resetting
+            contact_forces_wp = wp.from_torch(filtered_forces.contiguous(), dtype=wp.vec3)
             warp_targets = cpg_controller.compute_joint_targets(
                 default_feet_pos_body=calibrated_feet_body,
                 dir_angle_rad=walking_direction,
-                stride_forward=0.010,
-                stride_lateral=0.005,
+                stride_forward=STRIDE_FWD_CMD,
+                stride_lateral=STRIDE_LAT_CMD,
                 yaw_rate=0.0,
                 yaw_gain=0.0,
                 ramp=ramp,
                 contact_forces=contact_forces_wp
             )
 
-            # Zero-copy view into PyTorch
             torch_targets = wp.to_torch(warp_targets).reshape(-1)
             newton_targets = torch_targets[canonical_to_newton].unsqueeze(0)
+            robot_view.set_joint_position_targets(newton_targets)
 
-        # Hold targets across 420 Hz physics steps; render viewport at 60 Hz
-        robot_view.set_joint_position_targets(newton_targets)
+            # Stability Telemetry
+            _, curr_rot = robot_view.get_world_poses(clone=False)
+            tilt = float(2.0 * (curr_rot[0, 1]**2 + curr_rot[0, 2]**2))
+            tilt_samples.append(tilt)
+
+        # Physics Integration Step
         should_render = RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0)
         world.step(render=should_render)
 
-    poses, _ = robot_view.get_world_poses()
-    final_pos = poses[0].cpu().numpy()
-    print(f"[INFO] Final Position: X={final_pos[0]:.3f}, Y={final_pos[1]:.3f}, Z={final_pos[2]:.3f} m")
+        # Single Contact Query per Sub-step
+        raw_forces = feet_view.get_net_contact_forces(clone=False)
+        if raw_forces.dim() == 3:
+            raw_forces = raw_forces.squeeze(0)
+        continuous_forces = raw_forces / SIM_DT
+
+        accumulated_forces += continuous_forces
+
+        # Peak Impact Capture (post transient)
+        if step >= 40:
+            cf = continuous_forces[feet_to_canonical]
+            step_peak = float(torch.norm(cf, dim=-1).max().item())
+            if step_peak > peak_impact_n:
+                peak_impact_n = step_peak
+
+    # 3. Trial Results Evaluation
+    curr_pos, _ = robot_view.get_world_poses()
+    final_pos = curr_pos[0]
+    fwd_dist = float((final_pos[0] - start_pos[0]).item())
+    lat_drift = float(torch.abs(final_pos[1] - start_pos[1]).item())
+    mean_v = fwd_dist / TEST_DURATION_S
+    mean_tilt = float(np.mean(tilt_samples)) if tilt_samples else 0.0
+
+    print("\n" + "=" * 80)
+    print("LOCOMOTION RUN SUMMARY")
+    print("=" * 80)
+    print(f"Stride Command       : {STRIDE_FWD_CMD * 100:.1f} cm")
+    print(f"Total Forward Dist   : {fwd_dist:.3f} m")
+    print(f"Mean Forward Velocity: {mean_v:.3f} m/s")
+    print(f"Lateral Drift        : {lat_drift:.3f} m")
+    print(f"Peak Impact Force    : {peak_impact_n:.1f} N")
+    print(f"Mean Chassis Tilt    : {mean_tilt:.4f}")
+    print("=" * 80 + "\n")
 
     world.stop()
     simulation_app.close()

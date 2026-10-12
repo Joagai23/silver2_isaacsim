@@ -102,17 +102,13 @@ def audit_and_repair_joints(stage, robot_root_path=ROBOT_PRIM_PATH):
         raise RuntimeError(f"Robot root prim not found at {robot_root_path}")
     
     for prim in Usd.PrimRange(robot_prim):
-        # Drive configuration
+        # Configure Joint Drives
         if prim.IsA(UsdPhysics.Joint):
-            joint_name = prim.GetName()
-            drive_type = "tibia" if "tibia" in joint_name else "femur" if "femur" in joint_name else "coxa"
-            cfg = DEFAULT_DRIVES[drive_type]
-
             drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
             drive.CreateTypeAttr().Set("force")
-            drive.CreateStiffnessAttr().Set(cfg["stiffness"])
-            drive.CreateDampingAttr().Set(cfg["damping"])
-            drive.CreateMaxForceAttr().Set(cfg["max_force"])
+            drive.CreateStiffnessAttr().Set(K_P)
+            drive.CreateDampingAttr().Set(K_D)
+            drive.CreateMaxForceAttr().Set(MAX_TORQUE)
 
             rev = UsdPhysics.RevoluteJoint(prim)
             rev.CreateLowerLimitAttr().Set(-180.0)
@@ -171,11 +167,10 @@ def main():
     if ns is not None:
         ns.cfg.solver_cfg.nconmax = 1000
         ns.cfg.solver_cfg.njmax = 1200
-        # Increase iteration budget if exposed in your Newton build:
         if hasattr(ns.cfg.solver_cfg, "num_iterations"):
-            ns.cfg.solver_cfg.num_iterations = 64
+            ns.cfg.solver_cfg.num_iterations = 32
         if hasattr(ns.cfg.solver_cfg, "num_ls_iterations"):
-            ns.cfg.solver_cfg.num_ls_iterations = 15
+            ns.cfg.solver_cfg.num_ls_iterations = 6
 
     # Identify Tibia prim paths
     tibia_prim_paths = [f"{ROBOT_PRIM_PATH}/Tibia_{i}" for i in range(6)]
@@ -199,9 +194,17 @@ def main():
         )
         world.scene.add(robot_view)
 
+    world.reset()
     if not world.is_playing():
         world.play()
-    world.reset()
+
+    # Enforce verified drive gains across all DOFs in memory
+    joint_kps = torch.full((1, 18), K_P, device=DEVICE)
+    joint_kds = torch.full((1, 18), K_D, device=DEVICE)
+    try:
+        robot_view.set_gains(kps=joint_kps, kds=joint_kds)
+    except Exception:
+        pass
 
     # Hardware Abstraction Mapping Setup
     canonical_joint_names = []
@@ -241,10 +244,21 @@ def main():
         leg_mounts=SILVER2_MOUNTS,
         link_lengths=SILVER2_LINKS,
         dt=CPG_DT,
-        total_period=2.0,
+        total_period=1.348,
         gait="tripod",
         device=DEVICE
     )
+
+    # Optimized Gains
+    cpg_controller.l2 = 0.00459
+    cpg_controller.k1 = 0.925
+    cpg_controller.k2 = 0.0134
+    cpg_controller.k3 = 1.0111
+    cpg_controller.epsilon = 0.5005
+    cpg_controller.coupling_strength = 0.1522
+    cpg_controller.b = 3.146
+    cpg_controller.f_touch = 43.25
+    cpg_controller.f_release = 13.81
     
     # Dynamically-computed standing pose
     standing_targets_deg = np.array(SILVER2_STANDING_ANGLES_DEG, dtype=np.float32).flatten()
@@ -261,11 +275,11 @@ def main():
         world.step(render=RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0))
 
     # Extract true loaded joint angles
-    settled_q_rad = robot_view.get_joint_positions().squeeze()[newton_to_canonical].cpu().numpy()
-    settled_q_deg = np.rad2deg(settled_q_rad).reshape((6, 3))
+    # settled_q_rad = robot_view.get_joint_positions().squeeze()[newton_to_canonical].cpu().numpy()
+    # settled_q_deg = np.rad2deg(settled_q_rad).reshape((6, 3))
 
     # Compute empirical foot baseline directly from settled physics
-    calibrated_feet_body = cpg_controller.compute_default_feet_body(settled_q_deg)
+    calibrated_feet_body = cpg_controller.compute_default_feet_body(SILVER2_STANDING_ANGLES_DEG)
 
     # Convert to NumPy for host-side inspection
     calibrated_feet_np = calibrated_feet_body.numpy()

@@ -289,7 +289,7 @@ def main():
     # Newton buffer allocation scaled for 32 parallel robots
     ns = newton_ext.acquire_stage()
     if ns is not None:
-        ns.cfg.solver_cfg.nconmax = 20000
+        ns.cfg.solver_cfg.nconmax = 10560
         ns.cfg.solver_cfg.njmax = 12000
         
         if hasattr(ns.cfg.solver_cfg, "num_iterations"):
@@ -445,25 +445,25 @@ def main():
     }
 
     CURRICULUM = [
-        ("stage1_spatial",     250),
-        ("stage2_temporal",    250),
-        ("stage3_sensory",     150),
-        ("stage4_fine_tuning", 250),
+        ("stage1_spatial",     20),
+        ("stage2_temporal",    80),
+        ("stage3_sensory",     40),
+        ("stage4_fine_tuning", 80),
     ]
 
     TOTAL_GENERATIONS = sum(gens for _, gens in CURRICULUM)
 
     current_champion_genome = torch.tensor([
-        0.005,   # l2 (m)
-        1.000,   # k1
-        0.000,   # k2
-        1.000,   # k3
-        0.500,   # epsilon
-        2.000,   # period T (s)
-        0.400,   # coupling w
-        4.000,   # slope b
-        35.00,     # F_td (N)
-        10.00      # F_rel (N)
+        0.00365,   # l2 (m) - Converged
+        1.00000,   # k1     - Converged
+        0.02766,   # k2     - Converged
+        1.01495,   # k3     - Converged
+        0.50000,   # epsilon (ready for Stage 2)
+        2.00000,   # period T (ready for Stage 2)
+        0.40000,   # coupling w (ready for Stage 2)
+        4.00000,   # slope b (ready for Stage 2)
+        35.00,     # F_td
+        10.00      # F_rel
     ], device=DEVICE)
 
     best_overall_fitness = -float("inf")
@@ -559,149 +559,150 @@ def main():
                     newton_targets = torch_targets[:, canonical_to_newton]
                     robot_view.set_joint_position_targets(newton_targets)
 
-            # B. Physics Simulation Step
-            world.step(render=False)
+                # B. Physics Simulation Step
+                world.step(render=False)
 
-            # C. Single Unified State & Force Query per Sub-Step
-            q_curr = robot_view.get_joint_positions(clone=False)
-            q_vels = robot_view.get_joint_velocities(clone=False)
+                # C. Single Unified State & Force Query per Sub-Step
+                q_curr = robot_view.get_joint_positions(clone=False)
+                q_vels = robot_view.get_joint_velocities(clone=False)
 
-            raw_forces = feet_view.get_net_contact_forces(clone=False)
-            if raw_forces.dim() == 3:
-                raw_forces = raw_forces.squeeze(0)
-            continuous_forces = raw_forces / SIM_DT
+                raw_forces = feet_view.get_net_contact_forces(clone=False)
+                if raw_forces.dim() == 3:
+                    raw_forces = raw_forces.squeeze(0)
+                continuous_forces = raw_forces / SIM_DT
 
-            # Accumulate forces for CPG filtering
-            accumulated_forces += continuous_forces
+                # Accumulate forces for CPG filtering
+                accumulated_forces += continuous_forces
 
-            # D. Continuous Work / Energy Integration
-            tau_efforts = torch.clamp(
-                joint_kps * (newton_targets - q_curr) - joint_kds * q_vels,
-                -MAX_TORQUE,
-                MAX_TORQUE
+                # D. Continuous Work / Energy Integration
+                tau_efforts = torch.clamp(
+                    joint_kps * (newton_targets - q_curr) - joint_kds * q_vels,
+                    -MAX_TORQUE,
+                    MAX_TORQUE
+                )
+                step_power = torch.sum(torch.abs(tau_efforts * q_vels), dim=-1)
+                total_energy += step_power * SIM_DT
+
+                # E. Peak Impact Capture (post initial settle window)
+                if step >= 40:
+                    cf = continuous_forces[feet_to_canonical]
+                    fn_mags = torch.norm(cf.reshape(num_envs, 6, 3), dim=-1)
+                    peak_impact_forces = torch.maximum(peak_impact_forces, fn_mags.max(dim=1).values)
+
+            # ----------------------------------------------------------------------
+            # Multi-Objective Fitness Evaluation
+            # ----------------------------------------------------------------------
+            end_poses, _ = robot_view.get_world_poses()
+            forward_displacement = end_poses[:, 0] - start_pos[:, 0]
+            lateral_drift = torch.abs(end_poses[:, 1] - start_pos[:, 1])
+
+            eval_time_s = STEPS_PER_EVAL * SIM_DT
+            v_forward = forward_displacement / eval_time_s
+
+            safe_fwd = torch.clamp(forward_displacement, min=0.02)
+            drift_ratio = torch.clamp(lateral_drift / safe_fwd, max=2.0)
+            cost_of_transport = total_energy / (robot_weight_n * safe_fwd)
+
+            sigma_height = torch.std(root_z_buf, dim=0)
+            mean_tilt = torch.mean(root_tilt_buf, dim=0)
+            chassis_variability = sigma_height + mean_tilt
+
+            speed_reward = 10.0 * torch.clamp(v_forward, min=0.0, max=0.20)
+            drift_penalty = 0.5 * drift_ratio
+            cot_excess = torch.clamp(cost_of_transport - 5.0, min=0.0)
+            cot_penalty = torch.clamp(cot_excess * 0.05, max=6.0)
+            chassis_variability_penalty = torch.clamp(chassis_variability * 35.0, max=2.5)
+            excess_force = torch.clamp(peak_impact_forces - 300.0, min=0.0)
+            impact_penalty = torch.clamp(excess_force / 100.0, max=3.0)
+            stall_mask = (forward_displacement < 0.15).float()
+            stall_penalty = stall_mask * 6.0
+
+            fitness = (
+                speed_reward
+                - drift_penalty
+                - cot_penalty
+                - chassis_variability_penalty
+                - impact_penalty
+                - stall_penalty
             )
-            step_power = torch.sum(torch.abs(tau_efforts * q_vels), dim=-1)
-            total_energy += step_power * SIM_DT
 
-            # E. Peak Impact Capture (post initial settle window)
-            if step >= 40:
-                cf = continuous_forces[feet_to_canonical]
-                fn_mags = torch.norm(cf.reshape(num_envs, 6, 3), dim=-1)
-                peak_impact_forces = torch.maximum(peak_impact_forces, fn_mags.max(dim=1).values)
+            best_gen_idx = torch.argmax(fitness).item()
+            best_gen_fitness = fitness[best_gen_idx].item()
+            mean_fitness = fitness.mean().item()
+            std_fitness = fitness.std().item()
 
-        # ----------------------------------------------------------------------
-        # Multi-Objective Fitness Evaluation
-        # ----------------------------------------------------------------------
-        end_poses, _ = robot_view.get_world_poses()
-        forward_displacement = end_poses[:, 0] - start_pos[:, 0]
-        lateral_drift = torch.abs(end_poses[:, 1] - start_pos[:, 1])
+            best_dist = forward_displacement[best_gen_idx].item()
+            best_drift = lateral_drift[best_gen_idx].item()
+            best_cot = cost_of_transport[best_gen_idx].item()
+            best_impact = peak_impact_forces[best_gen_idx].item()
+            best_var = chassis_variability[best_gen_idx].item()
+            best_gen_genome = population[best_gen_idx].clone()
 
-        eval_time_s = STEPS_PER_EVAL * SIM_DT
-        v_forward = forward_displacement / eval_time_s
+            # 1. Update the active stage's local champion
+            if best_gen_fitness > stage_best_fitness:
+                stage_best_fitness = best_gen_fitness
+                current_champion_genome = best_gen_genome.clone()
 
-        safe_fwd = torch.clamp(forward_displacement, min=0.02)
-        drift_ratio = torch.clamp(lateral_drift / safe_fwd, max=2.0)
-        cost_of_transport = total_energy / (robot_weight_n * safe_fwd)
+            # 2. Update the run-wide global record (strictly monotonic)
+            if best_gen_fitness > best_overall_fitness:
+                best_overall_fitness = best_gen_fitness
+                best_overall_genome = best_gen_genome.clone()
 
-        sigma_height = torch.std(root_z_buf, dim=0)
-        mean_tilt = torch.mean(root_tilt_buf, dim=0)
-        chassis_variability = sigma_height + mean_tilt
+            row = [
+                global_gen,
+                round(best_gen_fitness, 4),
+                round(mean_fitness, 4),
+                round(std_fitness, 4),
+                round(best_dist, 4),
+                round(best_drift, 4),
+                round(best_cot, 2),
+                round(best_impact, 2),
+                round(best_var, 5)
+            ] + [round(float(val), 5) for val in best_gen_genome]
 
-        speed_reward = 10.0 * torch.clamp(v_forward, min=0.0, max=0.20)
-        drift_penalty = 0.5 * drift_ratio
-        cot_excess = torch.clamp(cost_of_transport - 5.0, min=0.0)
-        cot_penalty = torch.clamp(cot_excess * 0.05, max=6.0)
-        chassis_variability_penalty = torch.clamp(chassis_variability * 35.0, max=2.5)
-        excess_force = torch.clamp(peak_impact_forces - 300.0, min=0.0)
-        impact_penalty = torch.clamp(excess_force / 100.0, max=3.0)
-        stall_mask = (forward_displacement < 0.15).float()
-        stall_penalty = stall_mask * 6.0
+            with open(CSV_LOG_PATH, mode="a", newline="") as f:
+                csv.writer(f).writerow(row)
 
-        fitness = (
-            speed_reward
-            - drift_penalty
-            - cot_penalty
-            - chassis_variability_penalty
-            - impact_penalty
-            - stall_penalty
-        )
+            save_checkpoint(global_gen, population, fitness, best_overall_genome, best_overall_fitness)
 
-        best_gen_idx = torch.argmax(fitness).item()
-        best_gen_fitness = fitness[best_gen_idx].item()
-        mean_fitness = fitness.mean().item()
-        std_fitness = fitness.std().item()
-
-        best_dist = forward_displacement[best_gen_idx].item()
-        best_drift = lateral_drift[best_gen_idx].item()
-        best_cot = cost_of_transport[best_gen_idx].item()
-        best_impact = peak_impact_forces[best_gen_idx].item()
-        best_var = chassis_variability[best_gen_idx].item()
-        best_gen_genome = population[best_gen_idx].clone()
-
-        # 1. Update the active stage's local champion
-        if best_gen_fitness > stage_best_fitness:
-            stage_best_fitness = best_gen_fitness
-            current_champion_genome = best_gen_genome.clone()
-
-        # 2. Update the run-wide global record (strictly monotonic)
-        if best_gen_fitness > best_overall_fitness:
-            best_overall_fitness = best_gen_fitness
-            best_overall_genome = best_gen_genome.clone()
-
-        row = [
-            global_gen,
-            round(best_gen_fitness, 4),
-            round(mean_fitness, 4),
-            round(std_fitness, 4),
-            round(best_dist, 4),
-            round(best_drift, 4),
-            round(best_cot, 2),
-            round(best_impact, 2),
-            round(best_var, 5)
-        ] + [round(float(val), 5) for val in best_gen_genome]
-
-        with open(CSV_LOG_PATH, mode="a", newline="") as f:
-            csv.writer(f).writerow(row)
-
-        save_checkpoint(global_gen, population, fitness, best_overall_genome, best_overall_fitness)
-
-        print(
+            print(
                 f"[{stage_name[:6].upper()}] G{global_gen:03d} (P{stage_gen+1:02d}/{stage_generations}) | "
-                f"Fit: {best_gen_fitness:6.2f} (Top: {best_overall_fitness:6.2f}) | "
-                f"Dist: {best_dist:4.2f}m | Drift: {best_drift:4.2f}m | CoT: {best_cot:4.1f} | "
-                f"Peak F: {best_impact:5.1f}N | Var: {best_var:6.4f}"
+                f"Fit: {best_gen_fitness:7.4f} (Top: {best_overall_fitness:7.4f}) | "
+                f"Dist: {best_dist:5.3f}m | Drift: {best_drift:5.3f}m | CoT: {best_cot:4.2f} | "
+                f"Peak F: {best_impact:5.1f}N | Var: {best_var:6.4f}",
+                flush=True
             )
 
-        # ----------------------------------------------------------------------
-        # Genetic Operations: Crossover, Mutation & Elitism
-        # ----------------------------------------------------------------------
-        if active_mask.any():
-            k_elites = 2
-            _, elite_indices = torch.topk(fitness, k=k_elites)
-            elites = population[elite_indices].clone()
+            # ----------------------------------------------------------------------
+            # Genetic Operations: Crossover, Mutation & Elitism
+            # ----------------------------------------------------------------------
+            if active_mask.any():
+                k_elites = 2
+                _, elite_indices = torch.topk(fitness, k=k_elites)
+                elites = population[elite_indices].clone()
 
-            p1 = torch.randint(0, num_envs, (num_envs,), device=DEVICE)
-            p2 = torch.randint(0, num_envs, (num_envs,), device=DEVICE)
-            parent_a = torch.where((fitness[p1] > fitness[p2]).unsqueeze(1), population[p1], population[p2])
+                p1 = torch.randint(0, num_envs, (num_envs,), device=DEVICE)
+                p2 = torch.randint(0, num_envs, (num_envs,), device=DEVICE)
+                parent_a = torch.where((fitness[p1] > fitness[p2]).unsqueeze(1), population[p1], population[p2])
 
-            p3 = torch.randint(0, num_envs, (num_envs,), device=DEVICE)
-            p4 = torch.randint(0, num_envs, (num_envs,), device=DEVICE)
-            parent_b = torch.where((fitness[p3] > fitness[p4]).unsqueeze(1), population[p3], population[p4])
+                p3 = torch.randint(0, num_envs, (num_envs,), device=DEVICE)
+                p4 = torch.randint(0, num_envs, (num_envs,), device=DEVICE)
+                parent_b = torch.where((fitness[p3] > fitness[p4]).unsqueeze(1), population[p3], population[p4])
 
-            num_genes = population.shape[1]
-            blend_weights = torch.rand((num_envs, num_genes), device=DEVICE) * 1.4 - 0.20
-            crossed_offspring = blend_weights * parent_a + (1.0 - blend_weights) * parent_b
+                num_genes = population.shape[1]
+                blend_weights = torch.rand((num_envs, num_genes), device=DEVICE) * 1.4 - 0.20
+                crossed_offspring = blend_weights * parent_a + (1.0 - blend_weights) * parent_b
 
-            mutation_rate = max(0.02, 0.06 * (1.0 - (stage_gen + 1) / stage_generations))
-            raw_noise = torch.randn_like(crossed_offspring) * (bounds_max - bounds_min) * mutation_rate
-            masked_noise = raw_noise * active_mask.float().unsqueeze(0)
+                mutation_rate = max(0.02, 0.06 * (1.0 - (stage_gen + 1) / stage_generations))
+                raw_noise = torch.randn_like(crossed_offspring) * (bounds_max - bounds_min) * mutation_rate
+                masked_noise = raw_noise * active_mask.float().unsqueeze(0)
 
-            offspring = torch.clamp(crossed_offspring + masked_noise, bounds_min, bounds_max)
-            if frozen_mask.any():
-                offspring[:, frozen_mask] = current_champion_genome[frozen_mask]
-            offspring[:k_elites] = elites
-            population = offspring
-            cpg_controller.set_population_genomes(population)
+                offspring = torch.clamp(crossed_offspring + masked_noise, bounds_min, bounds_max)
+                if frozen_mask.any():
+                    offspring[:, frozen_mask] = current_champion_genome[frozen_mask]
+                offspring[:k_elites] = elites
+                population = offspring
+                cpg_controller.set_population_genomes(population)
 
     # --------------------------------------------------------------------------
     # Post-Evaluation Summary & Export

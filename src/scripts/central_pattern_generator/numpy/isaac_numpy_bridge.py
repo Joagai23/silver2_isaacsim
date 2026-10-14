@@ -2,26 +2,55 @@ RENDER_SIMULATION = True
 
 import isaacsim
 from isaacsim.simulation_app import SimulationApp
+
 simulation_app = SimulationApp({"headless": not RENDER_SIMULATION})
 
-# perform any Isaac Sim / Omniverse imports after instantiating the class
+import os
+import sys
+from pathlib import Path
 import numpy as np
 import omni
-import os
+
+# --------------------------------------------------------------------------
+# 1. Dynamic Path Resolution & sys.path Setup (Before Local Imports)
+# --------------------------------------------------------------------------
+SCRIPT_DIR = Path(__file__).resolve()
+# Traverse up to find the root directory containing 'src'
+PROJECT_ROOT = next((p for p in SCRIPT_DIR.parents if (p / "src").is_dir()), SCRIPT_DIR.parents[4])
+SRC_DIR = PROJECT_ROOT / "src"
+SCRIPTS_DIR = SRC_DIR / "scripts"
+
+# Register paths so both this bridge and sub-controllers locate silver2_constants
+for path_entry in [SCRIPTS_DIR, SRC_DIR, SCRIPT_DIR.parent]:
+    resolved_str = str(path_entry.resolve())
+    if resolved_str not in sys.path:
+        sys.path.insert(0, resolved_str)
+
+# Local & Isaac Sim Core Imports
+from numpy_cpg_controller import NumpyHexapodCPGController
+from silver2_constants.isaac_constants import *
 from isaacsim.core.api.world import World
 from isaacsim.core.prims import Articulation
-from numpy_cpg_controller import NumpyHexapodCPGController
 from isaacsim.core.utils.stage import get_current_stage
-from silver2_constants.isaac_constants import *
 
-# 0. Path Resolution
-USD_PATH = "/home/jorge/Documents/Code/silver2_isaacsim/src/scenes/silver2_isaac_sim_locomotion.usd"
+# --------------------------------------------------------------------------
+# 2. Stage & USD Resolution
+# --------------------------------------------------------------------------
+STAGE_NAME = "silver2_isaac_sim_locomotion.usd"
+
+# Check standard 'scenes'
+for candidate_rel in [Path("src/scenes") / STAGE_NAME]:
+    if (PROJECT_ROOT / candidate_rel).is_file():
+        USD_REL_PATH = candidate_rel
+        break
+else:
+    USD_REL_PATH = Path("src/scenes") / STAGE_NAME
+
+USD_PATH = str((PROJECT_ROOT / USD_REL_PATH).resolve())
+
 if not os.path.exists(USD_PATH):
     raise FileNotFoundError(f"[ERROR] Could not locate USD at: {USD_PATH}")
 
-# ---------------------------------------------------------
-# Robot & Simulation Configuration
-# ---------------------------------------------------------
 ROBOT_PRIM_PATH = "/World/SILVER2"
 SIM_DT = 0.01  # 100 Hz physics step, matching controller dt
 
@@ -34,8 +63,8 @@ def main():
     current_stage_url = usd_context.get_stage_url() or ""
 
     # Only open the stage if it is not already loaded in the viewport
-    if "silver2_isaac_sim_locomotion.usd" not in current_stage_url:
-        print(f"[INFO] Opening stage directly: {USD_PATH}")
+    if STAGE_NAME not in current_stage_url:
+        print(f"[INFO] Loading stage into Newton environment: {USD_REL_PATH}")
         usd_context.open_stage(USD_PATH)
     else:
         print("[INFO] Scene is already open in viewport. Skipping reload.")

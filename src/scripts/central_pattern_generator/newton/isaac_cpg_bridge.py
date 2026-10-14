@@ -79,8 +79,12 @@ from silver2_constants.isaac_constants import *
 from warp_cpg_controller import WarpHexapodCPGController
 
 # Path Resolution & Simulation Parameters
-USD_PATH = "/home/jorge/Documents/Code/silver2_isaacsim/src/scenes/newton/silver2_isaac_sim_locomotion.usd"
+SCRIPT_DIR = Path(__file__).resolve()
+PROJECT_ROOT = next((p for p in SCRIPT_DIR.parents if (p / "src").is_dir()), SCRIPT_DIR.parents[2])
+
 STAGE_NAME = "silver2_isaac_sim_locomotion.usd"
+USD_REL_PATH = Path("src/scenes/newton") / STAGE_NAME
+USD_PATH = str((PROJECT_ROOT / USD_REL_PATH).resolve())
 ROBOT_PRIM_PATH = "/World/SILVER2"
 
 SIM_DT = 1 / 420.0
@@ -89,11 +93,16 @@ RENDER_INTERVAL = int(round((1.0 / RENDER_FPS) / SIM_DT))
 DECIMATION_RATIO = 4
 CPG_DT = SIM_DT * DECIMATION_RATIO
 
-STRIDE_FWD_CMD = 0.010
-STRIDE_LAT_CMD = 0.005 
+# Benchmark Reference Speed (CPG Champion Nominal: Front = 0.238 m/s Right = 0.201 m/s )
+TARGET_SPEED = 0.201
+STRIDE_FWD_CMD = 0.005
+STRIDE_LAT_CMD = 0.010
+WALKING_DIRECTION = SILVER2_DIRECTION_MAP["right"]
+
 TEST_DURATION_S = 6.0
 NUM_LOCOMOTION_STEPS = int(round(TEST_DURATION_S / SIM_DT))
 RAMP_STEPS = 200
+ROBOT_WEIGHT = SILVER2_TOTAL_MASS * 9.81
 
 def audit_and_repair_joints(stage, robot_root_path=ROBOT_PRIM_PATH):
     """Explicit UsdPhysics.DriveAPI properties for all joints in the Hexapod Robot."""
@@ -143,7 +152,7 @@ def main():
     usd_context = omni.usd.get_context()
     current_stage_url = usd_context.get_stage_url() or ""
     if STAGE_NAME not in current_stage_url:
-        print(f"[INFO] Loading stage into Newton environment: {USD_PATH}")
+        print(f"[INFO] Loading stage into Newton environment: {USD_REL_PATH}")
         usd_context.open_stage(USD_PATH)
 
     stage = get_current_stage()
@@ -244,21 +253,36 @@ def main():
         leg_mounts=SILVER2_MOUNTS,
         link_lengths=SILVER2_LINKS,
         dt=CPG_DT,
-        total_period=1.348,
+        total_period=1.200,
         gait="tripod",
         device=DEVICE
     )
 
-    # Optimized Gains
+    # Optimized Gains for { STRIDE_FWD_CMD = 0.010, STRIDE_LAT_CMD = 0.005 } 
+    """
     cpg_controller.l2 = 0.00459
     cpg_controller.k1 = 0.925
     cpg_controller.k2 = 0.0134
     cpg_controller.k3 = 1.0111
     cpg_controller.epsilon = 0.5005
+    cpg_controller.total_period = 1.348
     cpg_controller.coupling_strength = 0.1522
     cpg_controller.b = 3.146
     cpg_controller.f_touch = 43.25
     cpg_controller.f_release = 13.81
+    """
+
+    # Optimized Gains for { STRIDE_FWD_CMD = 0.005, STRIDE_LAT_CMD = 0.010 }
+    cpg_controller.l2 = 0.00224
+    cpg_controller.k1 = 0.6437
+    cpg_controller.k2 = 0.0611
+    cpg_controller.k3 = 0.9433
+    cpg_controller.epsilon = 0.500
+    cpg_controller.total_period = 1.200
+    cpg_controller.coupling_strength = 0.4048
+    cpg_controller.b = 3.359
+    cpg_controller.f_touch = 45.68
+    cpg_controller.f_release = 6.87
     
     # Dynamically-computed standing pose
     standing_targets_deg = np.array(SILVER2_STANDING_ANGLES_DEG, dtype=np.float32).flatten()
@@ -274,22 +298,15 @@ def main():
         robot_view.set_joint_position_targets(torch_standing_targets)
         world.step(render=RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0))
 
-    # Extract true loaded joint angles
-    # settled_q_rad = robot_view.get_joint_positions().squeeze()[newton_to_canonical].cpu().numpy()
-    # settled_q_deg = np.rad2deg(settled_q_rad).reshape((6, 3))
-
     # Compute empirical foot baseline directly from settled physics
     calibrated_feet_body = cpg_controller.compute_default_feet_body(SILVER2_STANDING_ANGLES_DEG)
 
-    # Convert to NumPy for host-side inspection
-    calibrated_feet_np = calibrated_feet_body.numpy()
-    print("Calibrated Feet Z (m):", [round(float(calibrated_feet_np[i][2]), 4) for i in range(6)])
-
-    walking_direction = SILVER2_DIRECTION_MAP["forward"]
+    cmd_heading_deg = float(np.rad2deg(WALKING_DIRECTION))
 
     root_poses, _ = robot_view.get_world_poses()
     start_pos = root_poses[0].clone()
     peak_impact_n = 0.0
+    total_energy = 0.0
     tilt_samples = []
 
     # Filter buffers (6 feet, 3 axes)
@@ -311,7 +328,7 @@ def main():
             contact_forces_wp = wp.from_torch(filtered_forces.contiguous(), dtype=wp.vec3)
             warp_targets = cpg_controller.compute_joint_targets(
                 default_feet_pos_body=calibrated_feet_body,
-                dir_angle_rad=walking_direction,
+                dir_angle_rad=WALKING_DIRECTION,
                 stride_forward=STRIDE_FWD_CMD,
                 stride_lateral=STRIDE_LAT_CMD,
                 yaw_rate=0.0,
@@ -333,13 +350,27 @@ def main():
         should_render = RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0)
         world.step(render=should_render)
 
+        # Single Unified State & Force Query per Sub-Step
+        q_curr = robot_view.get_joint_positions(clone=False)
+        q_vels = robot_view.get_joint_velocities(clone=False)
+
         # Single Contact Query per Sub-step
         raw_forces = feet_view.get_net_contact_forces(clone=False)
         if raw_forces.dim() == 3:
             raw_forces = raw_forces.squeeze(0)
         continuous_forces = raw_forces / SIM_DT
 
+        # Accumulate forces for CPG filtering
         accumulated_forces += continuous_forces
+
+        # Continuous Work / Energy Integration
+        tau_efforts = torch.clamp(
+            joint_kps * (newton_targets - q_curr) - joint_kds * q_vels,
+            -MAX_TORQUE,
+            MAX_TORQUE
+        )
+        step_power = torch.sum(torch.abs(tau_efforts * q_vels)).item()
+        total_energy += step_power * SIM_DT
 
         # Peak Impact Capture (post transient)
         if step >= 40:
@@ -351,21 +382,36 @@ def main():
     # 3. Trial Results Evaluation
     curr_pos, _ = robot_view.get_world_poses()
     final_pos = curr_pos[0]
-    fwd_dist = float((final_pos[0] - start_pos[0]).item())
-    lat_drift = float(torch.abs(final_pos[1] - start_pos[1]).item())
-    mean_v = fwd_dist / TEST_DURATION_S
-    mean_tilt = float(np.mean(tilt_samples)) if tilt_samples else 0.0
+    delta_xy = final_pos[:2] - start_pos[:2]
+    dx = float(delta_xy[0].item())
+    dy = float(delta_xy[1].item())
+    total_planar_dist = float(torch.linalg.norm(delta_xy).item())
 
-    print("\n" + "=" * 80)
-    print("LOCOMOTION RUN SUMMARY")
-    print("=" * 80)
-    print(f"Stride Command       : {STRIDE_FWD_CMD * 100:.1f} cm")
-    print(f"Total Forward Dist   : {fwd_dist:.3f} m")
-    print(f"Mean Forward Velocity: {mean_v:.3f} m/s")
-    print(f"Lateral Drift        : {lat_drift:.3f} m")
-    print(f"Peak Impact Force    : {peak_impact_n:.1f} N")
-    print(f"Mean Chassis Tilt    : {mean_tilt:.4f}")
-    print("=" * 80 + "\n")
+    mean_planar_velocity = total_planar_dist / TEST_DURATION_S
+    trajectory_heading_deg = float(np.rad2deg(np.arctan2(dy, dx)))
+    mean_tilt = float(np.mean(tilt_samples)) if tilt_samples else 0.0
+    vel_tracking_ratio = (mean_planar_velocity / TARGET_SPEED * 100.0) if TARGET_SPEED > 1e-4 else 0.0
+
+    # Energetics & Cost of Transport
+    safe_disp = max(0.02, total_planar_dist)
+    cost_of_transport = total_energy / (ROBOT_WEIGHT * safe_disp)
+    
+    print("\n" + "=" * 85, flush=True)
+    print("CPG GAIT BENCHMARK SUMMARY", flush=True)
+    print("=" * 85, flush=True)
+    print(f"Stride Command (Fwd / Lat)    : ({STRIDE_FWD_CMD * 100:.1f} cm, {STRIDE_LAT_CMD * 100:.1f} cm) | Dir={cmd_heading_deg:.1f}°", flush=True)
+    print(f"Gait Parameters (T, Step H)   : Period={cpg_controller.total_period:.3f} s | Step H={cpg_controller.l2 * 100:.2f} cm", flush=True)
+    print("-" * 85, flush=True)
+    print(f"Total Planar Distance (XY)    : {total_planar_dist:.3f} m", flush=True)
+    print(f"  --> Longitudinal Disp (X)   : {dx:.3f} m", flush=True)
+    print(f"  --> Lateral Disp      (Y)   : {dy:.3f} m", flush=True)
+    print(f"Mean Planar Velocity          : {mean_planar_velocity:.3f} m/s (Target: {TARGET_SPEED:.3f} m/s -> {vel_tracking_ratio:.1f}%)", flush=True)
+    print(f"Trajectory Heading Angle      : {trajectory_heading_deg:.2f}° (Commanded: {cmd_heading_deg:.2f}°)", flush=True)
+    print(f"Cost of Transport (CoT)       : {cost_of_transport:.2f}", flush=True)
+    print(f"Total Mechanical Energy       : {total_energy:.2f} J", flush=True)
+    print(f"Peak Impact Force             : {peak_impact_n:.1f} N", flush=True)
+    print(f"Mean Chassis Tilt             : {mean_tilt:.4f}", flush=True)
+    print("=" * 85 + "\n", flush=True)
 
     world.stop()
     simulation_app.close()

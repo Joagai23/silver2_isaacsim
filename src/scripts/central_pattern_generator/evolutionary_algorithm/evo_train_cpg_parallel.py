@@ -1,4 +1,4 @@
-RENDER_SIMULATION = False  # Headless execution for maximum training throughput
+RENDER_SIMULATION = False
 
 import isaacsim
 from isaacsim.simulation_app import SimulationApp
@@ -68,9 +68,6 @@ from isaacsim.core.utils.stage import get_current_stage
 from isaacsim.core.simulation_manager import SimulationManager
 import isaacsim.physics.newton as newton_ext
 
-import sys
-from pathlib import Path
-
 # Resolve path to 'src/scripts'
 SCRIPTS_DIR = Path(__file__).resolve().parents[2]
 if str(SCRIPTS_DIR) not in sys.path:
@@ -82,8 +79,12 @@ from evo_warp_cpg_controller import VectorizedWarpHexapodCPGController
 # --------------------------------------------------------------------------
 # Simulation & Drive Parameters (Terrestrial Newton Calibrated)
 # --------------------------------------------------------------------------
-USD_PATH = "/home/jorge/Documents/Code/silver2_isaacsim/src/scenes/newton/silver2_training_grid_sphere.usd"
+SCRIPT_DIR = Path(__file__).resolve()
+PROJECT_ROOT = next((p for p in SCRIPT_DIR.parents if (p / "src").is_dir()), SCRIPT_DIR.parents[2])
+
 STAGE_NAME = "silver2_training_grid_sphere.usd"
+USD_REL_PATH = Path("src/scenes/newton") / STAGE_NAME
+USD_PATH = str((PROJECT_ROOT / USD_REL_PATH).resolve())
 
 SIM_DT = 1.0 / 420.0
 DECIMATION = 4
@@ -93,15 +94,15 @@ STEPS_PER_EVAL = 1260
 NUM_CPG_STEPS = STEPS_PER_EVAL // DECIMATION
 RAMP_STEPS = 200
 
-STRIDE_FWD_CMD = 0.010
-STRIDE_LAT_CMD = 0.005
+STRIDE_FWD_CMD = 0.005
+STRIDE_LAT_CMD = 0.010
+DIRECTION = SILVER2_DIRECTION_MAP["right"]
 
 # --------------------------------------------------------------------------
 # Checkpoint & Telemetry Paths
 # --------------------------------------------------------------------------
-OUTPUT_BASE_DIR = "/home/jorge/Documents/Code/silver2_isaacsim/src/scripts/central_pattern_generator/runs"
 RUN_ID = datetime.now().strftime("cpg_ga_%Y%m%d_%H%M%S")
-RUN_DIR = os.path.join(OUTPUT_BASE_DIR, RUN_ID)
+RUN_DIR = os.path.join(str(PROJECT_ROOT), "src/scripts/central_pattern_generator/runs", RUN_ID)
 os.makedirs(RUN_DIR, exist_ok=True)
 
 CSV_LOG_PATH = os.path.join(RUN_DIR, "history.csv")
@@ -270,8 +271,8 @@ def main():
         "best_fitness",
         "mean_fitness",
         "std_fitness",
-        "best_forward_dist_m",
-        "best_lateral_drift_m",
+        "best_target_dist_m",
+        "best_cross_track_drift_m",
         "best_cost_of_transport",
         "best_peak_impact_N",
         "best_chassis_var",
@@ -328,9 +329,9 @@ def main():
     )
     world.scene.add(feet_view)
 
+    world.reset()
     if not world.is_playing():
         world.play()
-    world.reset()
 
     # Enforce verified drive gains across all DOFs in memory
     joint_kps = torch.full((num_envs, 18), K_P, device=DEVICE)
@@ -445,7 +446,7 @@ def main():
     }
 
     CURRICULUM = [
-        ("stage1_spatial",     20),
+        ("stage1_spatial",     80),
         ("stage2_temporal",    80),
         ("stage3_sensory",     40),
         ("stage4_fine_tuning", 80),
@@ -453,17 +454,18 @@ def main():
 
     TOTAL_GENERATIONS = sum(gens for _, gens in CURRICULUM)
 
+    # Seed with the verified Forward Champion Genome
     current_champion_genome = torch.tensor([
-        0.00365,   # l2 (m) - Converged
-        1.00000,   # k1     - Converged
-        0.02766,   # k2     - Converged
-        1.01495,   # k3     - Converged
-        0.50000,   # epsilon (ready for Stage 2)
-        2.00000,   # period T (ready for Stage 2)
-        0.40000,   # coupling w (ready for Stage 2)
-        4.00000,   # slope b (ready for Stage 2)
-        35.00,     # F_td
-        10.00      # F_rel
+        0.00459,   # l2_clearance
+        0.9250,    # k1_stride_gain
+        0.0134,    # k2_stance_gain
+        1.0111,    # k3_vertical_gain
+        0.5005,    # epsilon_duty_factor
+        1.348,     # total_period_T 
+        0.1522,    # coupling_strength_w
+        3.146,     # sigmoid_slope_b
+        43.25,     # f_touch_td
+        13.81      # f_release_rel
     ], device=DEVICE)
 
     best_overall_fitness = -float("inf")
@@ -549,7 +551,7 @@ def main():
                     # Vectorized CPG Target Computation
                     warp_targets = cpg_controller.compute_joint_targets_vec(
                         default_feet_pos_body=default_feet_body_wp,
-                        dir_angle_rad=0.0,
+                        dir_angle_rad=DIRECTION,
                         stride_forward=STRIDE_FWD_CMD,
                         stride_lateral=STRIDE_LAT_CMD,
                         ramp=ramp,
@@ -593,28 +595,41 @@ def main():
             # Multi-Objective Fitness Evaluation
             # ----------------------------------------------------------------------
             end_poses, _ = robot_view.get_world_poses()
-            forward_displacement = end_poses[:, 0] - start_pos[:, 0]
-            lateral_drift = torch.abs(end_poses[:, 1] - start_pos[:, 1])
+            delta_x = end_poses[:, 0] - start_pos[:, 0]
+            delta_y = end_poses[:, 1] - start_pos[:, 1]
 
             eval_time_s = STEPS_PER_EVAL * SIM_DT
-            v_forward = forward_displacement / eval_time_s
 
-            safe_fwd = torch.clamp(forward_displacement, min=0.02)
-            drift_ratio = torch.clamp(lateral_drift / safe_fwd, max=2.0)
-            cost_of_transport = total_energy / (robot_weight_n * safe_fwd)
+            cmd_theta = torch.as_tensor(DIRECTION, device=DEVICE, dtype=torch.float32)
+            cos_theta = torch.cos(cmd_theta)
+            sin_theta = torch.sin(cmd_theta)
+
+            target_displacement = delta_x * cos_theta - delta_y * sin_theta
+            cross_track_drift = torch.abs(delta_x * sin_theta + delta_y * cos_theta)
+            v_target = target_displacement / eval_time_s
+
+            safe_disp = torch.clamp(target_displacement, min=0.02)
+            drift_ratio = torch.clamp(cross_track_drift / safe_disp, max=2.0)
+            cost_of_transport = total_energy / (robot_weight_n * safe_disp)
 
             sigma_height = torch.std(root_z_buf, dim=0)
             mean_tilt = torch.mean(root_tilt_buf, dim=0)
             chassis_variability = sigma_height + mean_tilt
 
-            speed_reward = 10.0 * torch.clamp(v_forward, min=0.0, max=0.20)
-            drift_penalty = 0.5 * drift_ratio
-            cot_excess = torch.clamp(cost_of_transport - 5.0, min=0.0)
-            cot_penalty = torch.clamp(cot_excess * 0.05, max=6.0)
+            # Speed Reward (Saturates at 0.20 m/s)
+            speed_reward = 10.0 * torch.clamp(v_target, min=0.0, max=0.20)
+            drift_penalty = 1.0 * drift_ratio
+
+            # CoT Penalty (Penalizes CoT > 0.90 in training)
+            cot_excess = torch.clamp(cost_of_transport - 0.90, min=0.0)
+            cot_penalty = torch.clamp(cot_excess * 2.0, max=5.0)
+
+            # Ground Impact Penalty (Penalizes peak forces > 160 N)
+            excess_force = torch.clamp(peak_impact_forces - 160.0, min=0.0)
+            impact_penalty = torch.clamp((excess_force / 40.0) ** 1.5, max=5.0)
+
             chassis_variability_penalty = torch.clamp(chassis_variability * 35.0, max=2.5)
-            excess_force = torch.clamp(peak_impact_forces - 300.0, min=0.0)
-            impact_penalty = torch.clamp(excess_force / 100.0, max=3.0)
-            stall_mask = (forward_displacement < 0.15).float()
+            stall_mask = (target_displacement < 0.15).float()
             stall_penalty = stall_mask * 6.0
 
             fitness = (
@@ -631,8 +646,8 @@ def main():
             mean_fitness = fitness.mean().item()
             std_fitness = fitness.std().item()
 
-            best_dist = forward_displacement[best_gen_idx].item()
-            best_drift = lateral_drift[best_gen_idx].item()
+            best_dist = target_displacement[best_gen_idx].item()
+            best_drift = cross_track_drift[best_gen_idx].item()
             best_cot = cost_of_transport[best_gen_idx].item()
             best_impact = peak_impact_forces[best_gen_idx].item()
             best_var = chassis_variability[best_gen_idx].item()
@@ -711,8 +726,8 @@ def main():
     print(f"[CHAMPION BENCHMARK SUMMARY across {num_envs} Parallel Instances]")
     print("=" * 90)
     print(f"Unified Fitness : {fitness.mean().item():6.2f} ± {fitness.std().item():.2f}")
-    print(f"Forward Dist (m): {forward_displacement.mean().item():6.3f} ± {forward_displacement.std().item():.3f} m")
-    print(f"Lateral Drift(m): {lateral_drift.mean().item():6.3f} ± {lateral_drift.std().item():.3f} m")
+    print(f"Target Dist (m) : {target_displacement.mean().item():6.3f} ± {target_displacement.std().item():.3f} m")
+    print(f"Cross-Track (m) : {cross_track_drift.mean().item():6.3f} ± {cross_track_drift.std().item():.3f} m")
     print(f"Cost of Transp. : {cost_of_transport.mean().item():6.2f} ± {cost_of_transport.std().item():.2f}")
     print(f"Peak Force  (N) : {peak_impact_forces.mean().item():6.1f} ± {peak_impact_forces.std().item():.1f} N")
     print(f"Chassis Var     : {chassis_variability.mean().item():6.4f} ± {chassis_variability.std().item():.4f}")

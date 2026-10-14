@@ -1,19 +1,17 @@
 import torch
 import numpy as np
 from typing import Tuple, Union
-from silver2_constants.isaac_constants import SILVER2_MOUNTS, SILVER2_LINKS, GAIT_CONFIGS
+from silver2_constants.isaac_constants import SILVER2_MOUNTS, SILVER2_LINKS, GAIT_CONFIGS, SILVER2_STANDING_ANGLES_DEG
 
 class OmnidirectionalGaitController:
     def __init__(
         self,
         gait_type: str = "tripod",
         step_height: float = 0.10,
-        stance_height: float = 0.30,
         gait_period: float = 2.0,
         device: str = "cuda:0"
     ):
         self.step_height = step_height
-        self.stance_height = stance_height
         self.T = gait_period
         self.device = device
 
@@ -49,6 +47,9 @@ class OmnidirectionalGaitController:
             [SILVER2_MOUNTS[name]["yaw"] for name in leg_names],
             dtype=torch.float32, device=self.device
         )
+
+        # Precompute and cache nominal standing foot positions in Body frame [6, 3]
+        self.default_feet_body = self.compute_default_feet_body()
 
     def body_to_local_frame(self, p_body: torch.Tensor) -> torch.Tensor:
         """
@@ -156,22 +157,43 @@ class OmnidirectionalGaitController:
         _, is_admissible = self.batch_leg_inv_kine(feet_local)
         return is_admissible
 
+    def compute_default_feet_body(
+        self, 
+        standing_angles_deg: Union[torch.Tensor, np.ndarray, list] = None
+    ) -> torch.Tensor:
+        """
+        Computes nominal standing foot coordinates in Body (chassis) frame [6, 3]
+        from joint angles (in degrees) using forward kinematics and mount transforms.
+        """
+        if standing_angles_deg is None:
+            standing_angles_deg = SILVER2_STANDING_ANGLES_DEG
+
+        if not isinstance(standing_angles_deg, torch.Tensor):
+            q_deg = torch.as_tensor(standing_angles_deg, dtype=torch.float32, device=self.device)
+        else:
+            q_deg = standing_angles_deg.to(device=self.device, dtype=torch.float32)
+
+        q_rad = torch.deg2rad(q_deg.reshape(6, 3))
+        feet_local = self.batch_leg_for_kine(q_rad)
+        return self.local_to_body_frame(feet_local)
+
     def compute_foot_trajectories(
         self,
         t: float,
         vx: float,
         vy: float,
         wz: float,
-        default_feet_body: torch.Tensor
+        default_feet_body: torch.Tensor = None
     ) -> torch.Tensor:
         """
         Computes instantaneous 3D Cartesian foot targets in Body Frame for all 6 legs.
         """
+        base_feet = self.default_feet_body if default_feet_body is None else default_feet_body
         tau = torch.remainder(t / self.T + self.phases, 1.0)
 
         # Linear + yaw displacement per leg
-        sx_lin = vx * self.T
-        sy_lin = vy * self.T
+        sx_lin = vx * self.T * self.beta
+        sy_lin = vy * self.T * self.beta
         sx_yaw = -wz * self.mount_pos[:, 1] * self.T
         sy_yaw =  wz * self.mount_pos[:, 0] * self.T
 
@@ -198,7 +220,7 @@ class OmnidirectionalGaitController:
             self.step_height * torch.sin(torch.pi * u_swing)
         )
 
-        feet_targets = default_feet_body.clone()
+        feet_targets = base_feet.clone()
         feet_targets[:, 0] += dx
         feet_targets[:, 1] += dy
         feet_targets[:, 2] += dz

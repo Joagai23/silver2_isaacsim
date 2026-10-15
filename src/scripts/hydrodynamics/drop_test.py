@@ -83,7 +83,7 @@ PROJECT_ROOT = next((p for p in SCRIPT_DIR.parents if (p / "src").is_dir()), SCR
 STAGE_NAME = "hydro_cube.usd"
 USD_REL_PATH = Path("src/scenes/newton") / STAGE_NAME
 USD_PATH = str((PROJECT_ROOT / USD_REL_PATH).resolve())
-CUBE_PRIM_PATH = "/Environment/Cube"
+CUBE_PRIM_PATH = "/World/Cube"
 
 SIM_DT = 1 / 420.0
 RENDER_FPS = 60.0
@@ -91,7 +91,7 @@ RENDER_INTERVAL = int(round((1.0 / RENDER_FPS) / SIM_DT))
 
 TEST_DURATION_S = 10.0
 NUM_SIM_STEPS = int(round(TEST_DURATION_S / SIM_DT))
-MAX_ACCEL = 50.0 
+MAX_PHYS_ACCEL = 20.0 
 
 def setup_newton_scene(stage, physics_scene_path="/physicsScene"):
     """Configures USD PhysicsScene prim attributes for Newton GPU execution."""
@@ -131,10 +131,16 @@ def main():
             device=DEVICE
         )
 
+    # Create and set Prim before initializing the Physics
     rigid_prim = RigidPrim(
             paths=str(CUBE_PRIM_PATH)
         )
+    
     rigid_prim.set_masses(wp.array([500.0], dtype=wp.float32, device=DEVICE))
+    raw_values = np.random.normal(0, 1, 4)
+    normalized = raw_values / np.linalg.norm(raw_values)
+    random_quat = np.array([normalized])
+    rigid_prim.set_local_poses(orientations=random_quat)
 
     world.initialize_physics()
 
@@ -196,10 +202,12 @@ def main():
         if last_linear_velocity is None:
             last_linear_velocity = linear_velocity.clone()
             last_angular_velocity = angular_velocity.clone()
-        
-        # Estimate acceleration
-        linear_acceleration = (linear_velocity - last_linear_velocity) / SIM_DT
-        angular_acceleration = (angular_velocity - last_angular_velocity) / SIM_DT
+            linear_acceleration = torch.zeros_like(linear_velocity)
+            angular_acceleration = torch.zeros_like(angular_velocity)
+        else:
+            # Estimate and clamp acceleration to prevent added-mass explosions
+            linear_acceleration = torch.clamp((linear_velocity - last_linear_velocity) / SIM_DT, -MAX_PHYS_ACCEL, MAX_PHYS_ACCEL)
+            angular_acceleration = torch.clamp((angular_velocity - last_angular_velocity) / SIM_DT, -MAX_PHYS_ACCEL, MAX_PHYS_ACCEL)
 
         # Run GPU Kernel
         (
@@ -236,7 +244,7 @@ def main():
         )
         
         # Safety Clamp (Prevent Explosions)
-        max_force = mass * MAX_ACCEL
+        max_force = mass * MAX_PHYS_ACCEL
         force_mag = torch.norm(net_force, dim=-1, keepdim=True)
         scale = torch.clamp(max_force / (force_mag + 1e-6), max=1.0)
         net_force = net_force * scale
@@ -251,6 +259,17 @@ def main():
         # Update stored velocities for the next frame
         last_linear_velocity = linear_velocity.clone()
         last_angular_velocity = angular_velocity.clone()
+
+        if step % 30 == 0:
+            print(
+                f"[Step {step:04d}] Z_pos: {positions[0, 2].item():+.3f}m | "
+                f"Z_vel: {linear_velocity[0, 2].item():+.3f}m/s | "
+                f"Z_acc: {linear_acceleration[0, 2].item():+.1f}m/s² | "
+                f"F_buoy: {t_buoyancy_force[0, 2].item():+.1f}N | "
+                f"F_drag: {t_drag_force[0, 2].item():+.1f}N | "
+                f"F_net: {net_force[0, 2].item():+.1f}N",
+                flush=True,
+            )
         
         should_render = RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0)
         world.step(render=should_render)

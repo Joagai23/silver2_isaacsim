@@ -20,7 +20,7 @@ This repository contains the simulation assets, physics plugins, and environment
 
 The environment is a digital twin of the **OBSEA Underwater Observatory** in Vilanova i la Geltrú, Catalonia, providing a realistic testing ground for seabed locomotion.
 
-Unlike standard rigid-body simulations, this project implements a **custom, fully vectorized hydrodynamics engine** powered by **Numba**. This allows for real-time, accurate simulation of fluid-structure interactions—including complex drag, added mass, and buoyancy effects—enabling the robot to walk and maneuver realistically on the virtual seabed.
+Unlike standard rigid-body simulations, this project implements a **custom, fully vectorized hydrodynamics engine** powered by **Warp**. This allows for real-time, accurate simulation of fluid-structure interactions—including complex drag, added mass, and buoyancy effects—enabling the robot to walk and maneuver realistically on the virtual seabed.
 
 The visual sensing in this project utilizes the optical underwater camera model developed by [OceanSim](https://github.com/umfieldrobotics/OceanSim).
 
@@ -31,13 +31,12 @@ The visual sensing in this project utilizes the optical underwater camera model 
 
 ## 🚀 Key Features
 
-### 1. Custom Numba Hydrodynamics Engine
+### 1. Custom Warp Hydrodynamics Engine
 We bypass the standard simplified linear damping to achieve realistic underwater behavior. The physics engine calculates:
 * **Variable Buoyancy:** Accurate volume displacement allowing for static neutral buoyancy.
 * **Hybrid Drag Model:** Combines quadratic drag ($v^2$) for high-speed realism with linear damping for low-speed stability.
 * **Added Mass & Inertia:** Simulates the "heaviness" of water displaced during acceleration (Coriolis/Centripetal effects approximation).
 * **Lift Forces:** Dynamic lift calculation based on the angle of attack.
-* **Performance:** Written in **Numba JIT** for C++ level performance within Python.
 
 ### 2. Verified Locomotion Controller
 This repo utilizes the same robust locomotion controller used in our field trials and other simulators:

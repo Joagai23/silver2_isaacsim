@@ -21,7 +21,6 @@ import warp as wp
 from pxr import UsdPhysics, Gf, Sdf
 from isaacsim.core.experimental.prims import RigidPrim
 
-
 DEVICE = "cuda:0"
 wp.init()
 torch.set_default_device(DEVICE)
@@ -249,28 +248,9 @@ def main():
             torques=wp.from_torch(net_torque.contiguous(), dtype=wp.float32),
         )
 
-        """
-        Compute your cross products relative to the true world-space Center of Mass (t_center_of_buoyancy - com_world) 
-        and call apply_forces_and_torques_at_pos(forces=net_force, torques=net_torque, is_global=True)
-        """
-
         # Update stored velocities for the next frame
         last_linear_velocity = linear_velocity.clone()
         last_angular_velocity = angular_velocity.clone()
-
-        if step % 30 == 0:
-            pos_z = positions[0, 2].item()
-            vel_z = linear_velocity[0, 2].item()
-            acc_z = linear_acceleration[0, 2].item()
-            buoy_z = t_buoyancy_force[0, 2].item()
-            drag_z = t_drag_force[0, 2].item()
-            add_z = t_added_mass_force[0, 2].item()
-            net_z = net_force[0, 2].item()
-            print(
-                f"[Step {step:04d}] Z_pos: {pos_z:+.3f}m | Z_vel: {vel_z:+.3f}m/s | Z_acc: {acc_z:+.1f}m/s² | "
-                f"F_buoy: {buoy_z:+.1f}N | F_drag: {drag_z:+.1f}N | F_add: {add_z:+.1f}N | F_net: {net_z:+.1f}N",
-                flush=True,
-            )
         
         should_render = RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0)
         world.step(render=should_render)

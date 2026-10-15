@@ -1,0 +1,56 @@
+{
+    "globals": {
+        "waterDensity": 1025.0,
+        "gravity": 9.81
+    },
+    "parts": {
+        "body": {
+            "angularAddedMassCoefficient": 0.1,
+            "angularDamping": 150.0,
+            "angularDragCoefficient": 0.8,
+            "liftCoefficient": 0.5,
+            "linearAddedMassCoefficient": 0.2,
+            "linearDamping": 300.0,
+            "linearDragCoefficient": 1.2,
+            "xDimension": 0.26,
+            "yDimension": 0.26,
+            "zDimension": 0.30
+        },
+        "coxa": {
+            "angularAddedMassCoefficient": 0.0,
+            "angularDamping": 1.0,
+            "angularDragCoefficient": 0.1,
+            "liftCoefficient": 0.1,
+            "linearAddedMassCoefficient": 0.0,
+            "linearDamping": 10.0,
+            "linearDragCoefficient": 0.8,
+            "xDimension": 0.06,
+            "yDimension": 0.06,
+            "zDimension": 0.09
+        },
+        "femur": {
+            "angularAddedMassCoefficient": 0.0,
+            "angularDamping": 2.0,
+            "angularDragCoefficient": 0.1,
+            "liftCoefficient": 0.1,
+            "linearAddedMassCoefficient": 0.0,
+            "linearDamping": 15.0,
+            "linearDragCoefficient": 0.9,
+            "xDimension": 0.06,
+            "yDimension": 0.09,
+            "zDimension": 0.06
+        },
+        "tibia": {
+            "angularAddedMassCoefficient": 0.0,
+            "angularDamping": 2.0,
+            "angularDragCoefficient": 0.1,
+            "liftCoefficient": 0.1,
+            "linearAddedMassCoefficient": 0.0,
+            "linearDamping": 20.0,
+            "linearDragCoefficient": 1.0,
+            "xDimension": 0.06,
+            "yDimension": 0.09,
+            "zDimension": 0.06
+        }
+    }
+}

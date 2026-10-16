@@ -89,7 +89,7 @@ SIM_DT = 1 / 420.0
 RENDER_FPS = 60.0
 RENDER_INTERVAL = int(round((1.0 / RENDER_FPS) / SIM_DT))
 
-TEST_DURATION_S = 10.0
+TEST_DURATION_S = 15.0
 NUM_SIM_STEPS = int(round(TEST_DURATION_S / SIM_DT))
 MAX_PHYS_ACCEL = 20.0 
 
@@ -134,9 +134,9 @@ def main():
     # Create and set Prim before initializing the Physics
     rigid_prim = RigidPrim(
             paths=str(CUBE_PRIM_PATH)
-        )
+    )
     
-    rigid_prim.set_masses(wp.array([500.0], dtype=wp.float32, device=DEVICE))
+    rigid_prim.set_masses(wp.array([1000.0], dtype=wp.float32, device=DEVICE))
     raw_values = np.random.normal(0, 1, 4)
     normalized = raw_values / np.linalg.norm(raw_values)
     random_quat = np.array([normalized])

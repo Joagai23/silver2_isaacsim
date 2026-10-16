@@ -1,8 +1,7 @@
 # pyright: reportInvalidTypeForm=false
 import warp as wp
 """
-Set of static hydrodynamic functions optimized with Warp.
-"""
+Set of static hydrodynamic functions optimized with Warp for multi-link articulated robots."""
 @wp.func
 def calculate_submersion_and_cob(
     position: wp.vec3,
@@ -27,15 +26,17 @@ def calculate_submersion_and_cob(
         # Transform local point to world space
         # World = Position + (Rotation * Local)
         local_point = keypoints[i]
-        world_point = position + wp.quat_rotate(orientation, local_point)
+        rotated_offset = wp.quat_rotate(orientation, local_point)
+        world_point = position + rotated_offset
 
-        # Track Min/Max for ratio
-        z_point = world_point[2]
-        if z_point < z_min: z_min = z_point
-        if z_point > z_max: z_max = z_point
+        # 3x3x3 sub-voxel centroids sit at +/- (1/3) of size,
+        # 1.5 * rotated_offset reaches the exact +/- (1/2) outer corner bounds
+        z_bound = position[2] + 1.5 * rotated_offset[2]
+        if z_bound < z_min: z_min = z_bound
+        if z_bound > z_max: z_max = z_bound
 
-        # Accumulate of CoB if underwater (z < 0)
-        if z_point < 0.0:
+        # Accumulate CoB using the true sub-voxel centroid
+        if world_point[2] < 0.0:
             sum_pos += world_point
             submerged_count += 1.0
 
@@ -74,8 +75,7 @@ def calculate_pressure_and_area(
     face_areas: wp.array(dtype=float)
 ):
     """
-    Calculates Center of Pressure and Total Projected Area.
-    Checks Z-height to ensure only underwater faces contribute to drag.
+    Calculates Center of Pressure and Total Projected Area for the specific link.
     """
     # Defaults
     cop = center_of_buoyancy
@@ -83,6 +83,7 @@ def calculate_pressure_and_area(
 
     if speed > 1.0e-6:
         cop_weighted_sum = wp.vec3(0.0, 0.0, 0.0)
+        cop_area_weight = float(0.0)
         n_faces = face_normals.shape[0]
         for i in range(n_faces):
             # Transform to world space
@@ -94,21 +95,22 @@ def calculate_pressure_and_area(
             local_center = face_centers[i]
             world_center = position + wp.quat_rotate(orientation, local_center)
 
-            # Alignment Check
-            dt = wp.dot(world_normal, velocity_direction)
-            alignment = -dt
+            # Alignment with opposing flow
+            alignment = -wp.dot(world_normal, velocity_direction)
 
             if alignment > 0.0:
                 # Check if face center is underwater
+                #if world_center[2] < 0.0:
+                area_val = alignment * face_areas[i]
+                total_projected_area += area_val
                 if world_center[2] < 0.0:
-                    area_val = alignment * face_areas[i]
-                    total_projected_area += area_val
+                    cop_area_weight += area_val
                     cop_weighted_sum += world_center * area_val
 
-        if total_projected_area > 1.0e-6:
-            cop = cop_weighted_sum / total_projected_area
+        if cop_area_weight > 1.0e-6:
+            cop = cop_weighted_sum / cop_area_weight
 
-        return cop, total_projected_area
+    return cop, total_projected_area
 
 @wp.func
 def calculate_hybrid_drag(
@@ -126,37 +128,26 @@ def calculate_hybrid_drag(
     angular_damp: float
 ):
     """
-    Calculates a hybrid drag force that combines a simple linear model (for low-speed stability)
-    and a physically-based quadratic model (for high-speed realism).
+    Calculates hybrid linear + quadratic drag for a link.
     """
     # --- Linear Drag ---
-    # Quadratic
     quad_drag_force = wp.vec3(0.0)
     if speed > 1.0e-6:
         drag_mag = 0.5 * water_density * (speed * speed) * linear_drag * total_projected_area
         quad_drag_force = -drag_mag * velocity_direction
-    # Damping
-    LOW_SPEED_THRESHOLD = 0.2
-    lin_damp_scale = 1.0
-    if speed < LOW_SPEED_THRESHOLD:
-        lin_damp_scale = speed / LOW_SPEED_THRESHOLD
-    linear_damping_force = -linear_damp * linear_velocity * lin_damp_scale
-    # Combined Linear Drag
+
+    linear_damping_force = -linear_damp * linear_velocity
     total_drag_force = (quad_drag_force + linear_damping_force) * sub_ratio
 
     # --- Angular Drag ---
     angular_speed = wp.length(angular_velocity)
-    # Quadratic
     quad_drag_torque = wp.vec3(0.0)
     if angular_speed > 1.0e-6:
         angular_direction = angular_velocity / angular_speed
         ang_mag = 0.5 * water_density * (angular_speed * angular_speed) * angular_drag * volume
         quad_drag_torque = -ang_mag * angular_direction
-    # Damping
-    ang_damp_scale = 1.0
-    if angular_speed < LOW_SPEED_THRESHOLD:
-        ang_damp_scale = angular_speed / LOW_SPEED_THRESHOLD
-    linear_ang_torque = -angular_damp * angular_velocity * ang_damp_scale
+
+    linear_ang_torque = -angular_damp * angular_velocity
     total_drag_torque = (quad_drag_torque + linear_ang_torque) * sub_ratio
 
     return total_drag_force, total_drag_torque
@@ -172,8 +163,7 @@ def calculate_lift(
     lift_coeff_param: float
 ):
     """
-    Calculates a simplified lift force based on the direction of incoming fluid (object's velocity) and the cube's
-    "up" direction.
+    Calculates simplified lift force based on incoming fluid velocity and link 'up' vector.
     """
     lift_force = wp.vec3(0.0)
     if speed > 1.0e-6 and sub_ratio > 1.0e-9:
@@ -181,9 +171,7 @@ def calculate_lift(
         up_vector = wp.quat_rotate(orientation, wp.vec3(0.0, 0.0, 1.0))
 
         # Angle of attack
-        dt = -(wp.dot(up_vector, velocity_direction))
-        if dt > 1.0: dt = 1.0
-        if dt < -1.0: dt = -1.0
+        dt = wp.clamp(-wp.dot(up_vector, velocity_direction), -1.0, 1.0)
         angle_of_attack = wp.asin(dt)
 
         # Lift Magnitude
@@ -196,8 +184,8 @@ def calculate_lift(
         if norm_lift_axis > 1.0e-6:
             lift_axis = lift_axis / norm_lift_axis
             lift_dir = wp.cross(lift_axis, velocity_direction)
-        
-        lift_force = lift_magnitude * lift_dir * sub_ratio
+            lift_force = lift_magnitude * lift_dir * sub_ratio
+
     return lift_force
     
 @wp.func
@@ -213,8 +201,8 @@ def calculate_added_mass(
 
     if sub_ratio > 1.0e-9:
         # Rotate world-space accelerations into the object's local (body) frame
-        linear_accel_local = wp.quat_rotate(orientation, linear_accel)
-        angular_accel_local = wp.quat_rotate(orientation, angular_accel)
+        linear_accel_local = wp.quat_rotate_inv(orientation, linear_accel)
+        angular_accel_local = wp.quat_rotate_inv(orientation, angular_accel)
 
         # Construct 6D Vector
         added_mass_linear_diagonal = added_mass_matrix[0]
@@ -232,21 +220,21 @@ def calculate_added_mass(
 
 @wp.kernel
 def solve_hydrodynamics_kernel(
-    # Inputs
+    # State Inputs: shape (N_total,)
     wp_position: wp.array(dtype=wp.vec3),
     wp_orientation: wp.array(dtype=wp.quat),
     wp_linear_velocity: wp.array(dtype=wp.vec3),
     wp_angular_velocity: wp.array(dtype=wp.vec3),
     wp_linear_acceleration: wp.array(dtype=wp.vec3),
     wp_angular_acceleration: wp.array(dtype=wp.vec3),
-    # Constants
-    wp_keypoints: wp.array(dtype=wp.vec3),
-    wp_normals: wp.array(dtype=wp.vec3),
-    wp_centers: wp.array(dtype=wp.vec3),
-    wp_areas: wp.array(dtype=float),
-    wp_params: wp.array(dtype=float),
-    wp_added_mass: wp.array(dtype=wp.vec3), # [lin_coeff, ang_coeff]
-    # Outputs
+    # Per-Link Constants: 2D arrays indexed by [tid]
+    wp_keypoints: wp.array(dtype=wp.vec3, ndim=2),   # shape (N_total, 27)
+    wp_normals: wp.array(dtype=wp.vec3, ndim=1),     # shape (6,) shared across all boxes
+    wp_centers: wp.array(dtype=wp.vec3, ndim=2),     # shape (N_total, 6)
+    wp_areas: wp.array(dtype=float, ndim=2),         # shape (N_total, 6)
+    wp_params: wp.array(dtype=float, ndim=2),        # shape (N_total, 8)
+    wp_added_mass: wp.array(dtype=wp.vec3, ndim=2),  # shape (N_total, 2)
+    # Outputs: shape (N_total,)
     out_buoyancy_force: wp.array(dtype=wp.vec3),
     out_drag_force: wp.array(dtype=wp.vec3),
     out_lift_force: wp.array(dtype=wp.vec3),
@@ -254,7 +242,7 @@ def solve_hydrodynamics_kernel(
     out_added_mass_force: wp.array(dtype=wp.vec3),
     out_added_mass_torque: wp.array(dtype=wp.vec3),
     out_center_of_buoyancy: wp.array(dtype=wp.vec3),
-    out_center_of_pressure: wp.array(dtype=wp.vec3)
+    out_center_of_pressure: wp.array(dtype=wp.vec3),
 ):
     # Thread Indexing
     tid = wp.tid()
@@ -267,18 +255,21 @@ def solve_hydrodynamics_kernel(
     linear_acceleration = wp_linear_acceleration[tid]
     angular_acceleration = wp_angular_acceleration[tid]
 
-    # Unpack Parameters [density, gravity, lin_drag, ang_drag, lin_damp, ang_damp, lift, volume]
-    water_density = wp_params[0]
-    gravity = wp_params[1]
-    linear_drag = wp_params[2]
-    angular_drag = wp_params[3]
-    linear_damp = wp_params[4]
-    angular_damp = wp_params[5]
-    lift = wp_params[6]
-    volume = wp_params[7]
+    # Unpack Parameters
+    link_params = wp_params[tid]
+    water_density = link_params[0]
+    gravity = link_params[1]
+    linear_drag = link_params[2]
+    angular_drag = link_params[3]
+    linear_damp = link_params[4]
+    angular_damp = link_params[5]
+    lift = link_params[6]
+    volume = link_params[7]
 
-    # Submersion and Buoyancy
-    sub_ratio, center_of_buoyancy = calculate_submersion_and_cob(position, orientation, wp_keypoints)
+    # Submersion and Buoyancy for this link
+    sub_ratio, center_of_buoyancy = calculate_submersion_and_cob(
+        position, orientation, wp_keypoints[tid]
+    )
 
     # Initialize Outputs
     buoyancy_force = wp.vec3(0.0)
@@ -302,7 +293,7 @@ def solve_hydrodynamics_kernel(
         # Center of Pressure and Projected Area
         center_of_pressure, total_projected_area = calculate_pressure_and_area(
             speed, velocity_direction, position, orientation, center_of_buoyancy,
-            wp_normals, wp_centers, wp_areas
+            wp_normals, wp_centers[tid], wp_areas[tid]
         )
 
         # Drag
@@ -321,7 +312,7 @@ def solve_hydrodynamics_kernel(
         # Added Mass
         added_mass_force, added_mass_torque = calculate_added_mass(
             linear_acceleration, angular_acceleration, orientation,
-            sub_ratio, wp_added_mass
+            sub_ratio, wp_added_mass[tid]
         )
     
     # Outputs

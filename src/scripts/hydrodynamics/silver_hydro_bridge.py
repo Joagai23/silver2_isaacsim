@@ -81,7 +81,7 @@ from warp_hydrodynamics_wrapper import WarpHydrodynamicsWrapper
 SCRIPT_DIR = Path(__file__).resolve()
 PROJECT_ROOT = next((p for p in SCRIPT_DIR.parents if (p / "src").is_dir()), SCRIPT_DIR.parents[2])
 
-STAGE_NAME = "silver2_isaac_sim_locomotion.usd"
+STAGE_NAME = "silver2_scaffolding.usd"
 USD_REL_PATH = Path("src/scenes/newton") / STAGE_NAME
 USD_PATH = str((PROJECT_ROOT / USD_REL_PATH).resolve())
 ROBOT_PRIM_PATH = "/World/SILVER2"
@@ -244,9 +244,9 @@ def main():
     canonical_foot_indices = []
 
     for leg_idx in range(6):
-        canonical_joint_names.append(f"coxa_joint_{leg_idx}")
-        canonical_joint_names.append(f"femur_joint_{leg_idx}")
-        canonical_joint_names.append(f"tibia_joint_{leg_idx}")
+        canonical_joint_names.append(f"Joint_Body_Coxa_{leg_idx}")
+        canonical_joint_names.append(f"Joint_Coxa_Femur_{leg_idx}")
+        canonical_joint_names.append(f"Joint_Femur_Tibia_{leg_idx}")
 
         for view_idx, path in enumerate(view_paths):
             path_lower = path.lower()

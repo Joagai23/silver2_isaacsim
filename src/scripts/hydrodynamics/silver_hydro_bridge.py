@@ -91,7 +91,7 @@ SIM_DT = 1 / 420.0
 RENDER_FPS = 60.0
 RENDER_INTERVAL = int(round((1.0 / RENDER_FPS) / SIM_DT))
 
-TEST_DURATION_S = 7.5
+TEST_DURATION_S = 20.0
 NUM_SIM_STEPS = int(round(TEST_DURATION_S / SIM_DT))
 MAX_PHYS_ACCEL = 20.0
 
@@ -192,6 +192,7 @@ def main():
         name="silver2_hydro_links",
         reset_xform_properties=False
     )
+    world.scene.add(robot_links_view)
 
     # Fetch per-link masses for accurate safety clamping
     link_masses = robot_links_view.get_masses().to(dtype=torch.float32).view(-1, 1)
@@ -274,14 +275,10 @@ def main():
     robot_view.set_joint_positions(torch_standing_targets)
     robot_view.set_joint_velocities(torch.zeros_like(torch_standing_targets))
 
-    print("[INFO] Running 500 stance settling steps...")
-    for step in range(500):
-        robot_view.set_joint_position_targets(torch_standing_targets)
-        world.step(render=RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0))
-
     print(f"[INFO] Running {NUM_SIM_STEPS} hydrodynamic steps...")
     last_linear_velocity = None
     last_angular_velocity = None
+    z_force_history = []
 
     for step in range(NUM_SIM_STEPS):
         # Fetch world poses and velocities for all 19 links in parallel
@@ -340,27 +337,22 @@ def main():
         t_torque_drag = torch.cross(t_center_of_pressure - positions, t_drag_force, dim=-1)
         t_torque_lift = torch.cross(t_center_of_pressure - positions, t_lift_force, dim=-1)
 
-        # Final net force and torque per link
-        net_force = t_buoyancy_force + t_drag_force + t_lift_force + t_added_mass_force
-        net_torque = (
-            t_torque_buoyancy
-            + t_torque_drag
-            + t_torque_lift
-            + t_drag_torque
-            + t_added_mass_torque
-        )
+        # Safely Clamp Dynamic Forces
+        dynamic_force = t_drag_force + t_lift_force + t_added_mass_force
+        dynamic_torque = t_torque_drag + t_torque_lift + t_drag_torque + t_added_mass_torque
         
-        # Per-link Safety Clamp
         max_force = link_masses * MAX_PHYS_ACCEL
-        force_mag = torch.norm(net_force, dim=-1, keepdim=True)
+        force_mag = torch.norm(dynamic_force, dim=-1, keepdim=True)
         scale = torch.clamp(max_force / (force_mag + 1e-6), max=1.0)
-        net_force = net_force * scale
-        net_torque = net_torque * scale
+
+        net_force = t_buoyancy_force + (dynamic_force * scale)
+        net_torque = t_torque_buoyancy + (dynamic_torque * scale)
         
         # Apply forces and torques to all 19 links in the simulation
         robot_links_view.apply_forces_and_torques_at_pos(
             forces=net_force.contiguous(),
             torques=net_torque.contiguous(),
+            is_global=True
         )
 
         # Update stored velocities for the next frame
@@ -372,6 +364,23 @@ def main():
 
         should_render = RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0)
         world.step(render=should_render)
+
+        raw_foot_forces = feet_view.get_net_contact_forces(dt=SIM_DT)
+        if raw_foot_forces is not None:
+            ordered_foot_forces = raw_foot_forces[canonical_foot_indices]
+            foot_fz = ordered_foot_forces[:, 2]
+            z_force_history.append(foot_fz.detach().cpu().numpy())
+
+            if (step + 1) % 420 == 0:
+                total_fz = foot_fz.sum().item()
+                total_weight = (link_masses.sum() * 9.81).item()
+                total_buoyancy = t_buoyancy_force[:, 2].sum().item()
+                expected_submerged_weight = total_weight - total_buoyancy
+                fz_str = ", ".join([f"L{i}: {val:5.2f}N" for i, val in enumerate(foot_fz.tolist())])
+                print(
+                    f"[t={(step+1)*SIM_DT:4.1f}s] Tip Fz: [{fz_str}] | "
+                    f"Sum Fz: {total_fz:6.2f}N (Expected W_sub: {expected_submerged_weight:6.2f}N)"
+                )
         
     world.stop()
     simulation_app.close()

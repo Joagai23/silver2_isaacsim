@@ -378,6 +378,7 @@ def main():
     peak_impact_n = 0.0
     total_energy = 0.0
     tilt_samples = []
+    z_force_history = []
 
     # Filter buffers (6 feet, 3 axes)
     accumulated_forces = torch.zeros((6, 3), device=DEVICE)
@@ -421,7 +422,7 @@ def main():
             last_linear_velocity, last_angular_velocity
         )
 
-        # C. Apply CPG Joint Targets (NOT torch_standing_targets!)
+        # C. Apply CPG Joint Targets
         robot_view.set_joint_position_targets(newton_targets)
 
         should_render = RENDER_SIMULATION and ((step + 1) % RENDER_INTERVAL == 0)
@@ -431,11 +432,12 @@ def main():
         q_curr = robot_view.get_joint_positions(clone=False)
         q_vels = robot_view.get_joint_velocities(clone=False)
 
-        raw_forces = feet_view.get_net_contact_forces(clone=False)
-        if raw_forces.dim() == 3:
-            raw_forces = raw_forces.squeeze(0)
-        continuous_forces = raw_forces / SIM_DT
+        # Single Contact Query per Sub-step
+        continuous_forces = feet_view.get_net_contact_forces(dt=SIM_DT, clone=False)
+        if continuous_forces.dim() == 3:
+            continuous_forces = continuous_forces.squeeze(0)
 
+        # Accumulate forces for CPG filtering
         accumulated_forces += continuous_forces
 
         tau_efforts = torch.clamp(
@@ -452,6 +454,8 @@ def main():
             step_peak = float(torch.norm(cf, dim=-1).max().item())
             if step_peak > peak_impact_n:
                 peak_impact_n = step_peak
+            # Track mean total vertical ground reaction force (Sum Fz) during walking
+            z_force_history.append(float(continuous_forces[feet_to_canonical, 2].sum().item()))
 
     # Trial Results Evaluation
     curr_pos, _ = robot_view.get_world_poses()
@@ -469,6 +473,7 @@ def main():
     # Energetics & Cost of Transport
     safe_disp = max(0.02, total_planar_dist)
     cost_of_transport = total_energy / (ROBOT_WEIGHT * safe_disp)
+    mean_sum_fz = float(np.mean(z_force_history)) if z_force_history else 0.0
     
     print("\n" + "=" * 85, flush=True)
     print("CPG GAIT BENCHMARK SUMMARY", flush=True)
@@ -485,6 +490,7 @@ def main():
     print(f"Total Mechanical Energy       : {total_energy:.2f} J", flush=True)
     print(f"Peak Impact Force             : {peak_impact_n:.1f} N", flush=True)
     print(f"Mean Chassis Tilt             : {mean_tilt:.4f}", flush=True)
+    print(f"Mean Total Vertical Load (Fz) : {mean_sum_fz:.2f} N (Static W_sub: 20.54 N)", flush=True)
     print("=" * 85 + "\n", flush=True)
         
     world.stop()

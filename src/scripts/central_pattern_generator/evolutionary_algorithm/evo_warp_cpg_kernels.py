@@ -259,7 +259,7 @@ def map_foot_trajectory_omnidirectional_kernel_vec(
     pos_up = p_def[2]
 
     # Translational stroke decomposition
-    l_lat_trans = -stride_lateral * wp.sin(dir_angle_rad)
+    l_lat_trans = stride_lateral * wp.sin(dir_angle_rad)
     l_fwd_trans = -stride_forward * wp.cos(dir_angle_rad)
 
     # Superimposed rotational yaw velocity

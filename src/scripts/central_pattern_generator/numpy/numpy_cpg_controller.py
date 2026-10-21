@@ -151,7 +151,7 @@ class NumpyHexapodCPGController:
         pos_fwd = default_feet_pos_body[:, 1]
 
         # Base translational strokes
-        l_lat_trans = -stride_lateral * np.sin(dir_angle_rad)
+        l_lat_trans = stride_lateral * np.sin(dir_angle_rad)
         l_fwd_trans = -stride_forward * np.cos(dir_angle_rad)
 
         # Rotational twist

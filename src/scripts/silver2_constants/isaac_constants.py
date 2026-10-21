@@ -46,15 +46,15 @@ SILVER2_STANDING_ANGLES_DEG = np.array([
 SILVER2_DIRECTION_MAP = {
     # Cardinal directions
     "forward":         0.0,
-    "right":           np.pi / 2.0,
+    "left":            np.pi / 2.0,
     "backward":        np.pi,
-    "left":           -np.pi / 2.0,
+    "right":          -np.pi / 2.0,
 
     # Diagonals
-    "forward_right":   np.pi / 4.0,
+    "forward_right":   -np.pi / 4.0,
     "backward_right":  3.0 * np.pi / 4.0,
     "backward_left":  -3.0 * np.pi / 4.0,
-    "forward_left":   -np.pi / 4.0,
+    "forward_left":    np.pi / 4.0,
 }
 
 # Explicit Stance Parameters

@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from typing import Tuple, Union
-from silver2_constants.isaac_constants import SILVER2_MOUNTS, SILVER2_LINKS, GAIT_CONFIGS, SILVER2_STANDING_ANGLES_DEG
+from src.scripts.silver2_constants.isaac_constants import SILVER2_MOUNTS, SILVER2_LINKS, GAIT_CONFIGS, SILVER2_STANDING_ANGLES_DEG
 
 class OmnidirectionalGaitController:
     def __init__(

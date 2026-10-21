@@ -2,8 +2,8 @@
 import warp as wp
 import numpy as np
 from typing import Dict, Tuple, Any, Optional
-from silver2_constants.isaac_constants import GAIT_CONFIGS
-from warp_cpg_kernels import *
+from src.scripts.silver2_constants.isaac_constants import GAIT_CONFIGS
+from src.scripts.central_pattern_generator.newton.warp_cpg_kernels import *
 
 wp.init()
 

@@ -77,7 +77,6 @@ if str(SCRIPTS_DIR) not in sys.path:
 from warp_hydrodynamics_wrapper import WarpHydrodynamicsWrapper
 from src.scripts.silver2_constants.isaac_constants import *
 from src.scripts.central_pattern_generator.newton.warp_cpg_controller import WarpHexapodCPGController
-from src.scripts.omnidirectional_gait.omnidirectional_gait_controller import OmnidirectionalGaitController
 
 # Path Resolution & Simulation Parameters
 SCRIPT_DIR = Path(__file__).resolve()
@@ -288,17 +287,17 @@ def main():
         device=DEVICE
     )
 
-    # Optimized Gains for { STRIDE_FWD_CMD = 0.005, STRIDE_LAT_CMD = 0.010 } - Current Terrestrial Optimization
-    cpg_controller.l2 = 0.00224
-    cpg_controller.k1 = 0.6437
-    cpg_controller.k2 = 0.0611
-    cpg_controller.k3 = 0.9433
-    cpg_controller.epsilon = 0.500
-    cpg_controller.total_period = 1.200
-    cpg_controller.coupling_strength = 0.4048
-    cpg_controller.b = 3.359
-    cpg_controller.f_touch = 3.20
-    cpg_controller.f_release = 0.50
+    # Optimized Gains for { STRIDE_FWD_CMD = 0.005, STRIDE_LAT_CMD = 0.010 }
+    cpg_controller.l2 = 0.002
+    cpg_controller.k1 = 0.5547
+    cpg_controller.k2 = 0.1111
+    cpg_controller.k3 = 0.8039
+    cpg_controller.epsilon = 0.4908
+    cpg_controller.total_period = 1.171
+    cpg_controller.coupling_strength = 0.6599
+    cpg_controller.b = 3.163
+    cpg_controller.f_touch = 5.01
+    cpg_controller.f_release = 0.22
     
     # Dynamically-computed standing pose
     standing_targets_deg = np.array(SILVER2_STANDING_ANGLES_DEG, dtype=np.float32).flatten()
@@ -368,6 +367,10 @@ def main():
         should_render = RENDER_SIMULATION and ((settle_step + 1) % RENDER_INTERVAL == 0)
         world.step(render=should_render)
 
+    # Capture the verified settled base poses and joint states
+    settled_root_pos, _ = robot_view.get_world_poses(clone=True)
+    print(f"[INFO] Settling complete. Base Z: {settled_root_pos[0, 2]:.4f} m. State buffers established.")
+
     # Compute empirical foot baseline directly from settled physics
     calibrated_feet_body = cpg_controller.compute_default_feet_body(SILVER2_STANDING_ANGLES_DEG)
 
@@ -379,6 +382,8 @@ def main():
     total_energy = 0.0
     tilt_samples = []
     z_force_history = []
+    root_z_buf = torch.empty((NUM_SIM_STEPS, 1), device=DEVICE)
+    root_tilt_buf = torch.empty((NUM_SIM_STEPS, 1), device=DEVICE)
 
     # Filter buffers (6 feet, 3 axes)
     accumulated_forces = torch.zeros((6, 3), device=DEVICE)
@@ -389,6 +394,7 @@ def main():
     for step in range(NUM_SIM_STEPS):
         # A. CPG Control Step (Decimated)
         if step % DECIMATION_RATIO == 0:
+            cpg_idx = step // DECIMATION_RATIO
             ramp = min(1.0, (step + 1) / float(RAMP_STEPS))
 
             # Exponential Moving Average (EMA) low-pass filter.
@@ -413,9 +419,9 @@ def main():
             newton_targets = torch_targets[canonical_to_newton].unsqueeze(0)
 
             # Stability Telemetry
-            _, curr_rot = robot_view.get_world_poses(clone=False)
-            tilt = float(2.0 * (curr_rot[0, 1]**2 + curr_rot[0, 2]**2))
-            tilt_samples.append(tilt)
+            curr_root_pos, curr_root_rot = robot_view.get_world_poses(clone=False)
+            root_z_buf[cpg_idx] = curr_root_pos[:, 2]
+            root_tilt_buf[cpg_idx] = 2.0 * (curr_root_rot[:, 1]**2 + curr_root_rot[:, 2]**2)
 
         # B. Apply Hydrodynamic Forces
         last_linear_velocity, last_angular_velocity = apply_hydrodynamics_step(
@@ -467,13 +473,17 @@ def main():
 
     mean_planar_velocity = total_planar_dist / TEST_DURATION_S
     trajectory_heading_deg = float(np.rad2deg(np.arctan2(dy, dx)))
-    mean_tilt = float(np.mean(tilt_samples)) if tilt_samples else 0.0
     vel_tracking_ratio = (mean_planar_velocity / TARGET_SPEED * 100.0) if TARGET_SPEED > 1e-4 else 0.0
 
     # Energetics & Cost of Transport
     safe_disp = max(0.02, total_planar_dist)
     cost_of_transport = total_energy / (ROBOT_WEIGHT * safe_disp)
     mean_sum_fz = float(np.mean(z_force_history)) if z_force_history else 0.0
+
+    sigma_height = torch.std(root_z_buf, dim=0)
+    mean_height_drift = torch.abs(torch.mean(root_z_buf, dim=0) - settled_root_pos[:, 2])
+    mean_tilt = torch.mean(root_tilt_buf, dim=0)
+    chassis_variability = sigma_height + mean_height_drift + mean_tilt
     
     print("\n" + "=" * 85, flush=True)
     print("CPG GAIT BENCHMARK SUMMARY", flush=True)
@@ -489,7 +499,8 @@ def main():
     print(f"Cost of Transport (CoT)       : {cost_of_transport:.2f}", flush=True)
     print(f"Total Mechanical Energy       : {total_energy:.2f} J", flush=True)
     print(f"Peak Impact Force             : {peak_impact_n:.1f} N", flush=True)
-    print(f"Mean Chassis Tilt             : {mean_tilt:.4f}", flush=True)
+    print(f"Mean Chassis Tilt             : {float(mean_tilt):.4f}", flush=True)
+    print(f"Chassis Variability           : {float(chassis_variability):.4f}", flush=True)
     print(f"Mean Total Vertical Load (Fz) : {mean_sum_fz:.2f} N (Static W_sub: 20.54 N)", flush=True)
     print("=" * 85 + "\n", flush=True)
         

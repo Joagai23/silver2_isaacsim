@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from typing import Sequence, Union
 import warp as wp
-from warp_hydrodynamics import solve_hydrodynamics_kernel
+from src.scripts.hydrodynamics.warp_hydrodynamics import solve_hydrodynamics_kernel
 
 class WarpHydrodynamicsWrapper:
     """

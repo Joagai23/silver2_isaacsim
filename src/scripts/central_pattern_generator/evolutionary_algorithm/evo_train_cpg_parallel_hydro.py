@@ -529,8 +529,8 @@ def main():
     # 7. Evolutionary Optimization (10 Parameters)
     # Genome: [l2, k1, k2, k3, epsilon, total_period, coupling_strength, b, f_touch, f_release]
     # --------------------------------------------------------------------------
-    GENOME_MIN_WIDE = torch.tensor([0.002, 0.50, 0.00, 0.80, 0.45, 0.90, 0.10, 1.5, 1.80, 0.20], device=DEVICE)
-    GENOME_MAX_WIDE = torch.tensor([0.025, 1.35, 0.12, 1.20, 0.75, 2.80, 0.85, 5.0, 6.50, 1.50], device=DEVICE)
+    GENOME_MIN_WIDE = torch.tensor([0.001, 0.45, 0.00, 0.72, 0.44, 0.90, 0.15, 1.5, 1.80, 0.20], device=DEVICE)
+    GENOME_MAX_WIDE = torch.tensor([0.020, 1.25, 0.12, 1.15, 0.72, 2.50, 0.90, 5.0, 6.50, 1.50], device=DEVICE)
 
     CURRICULUM_MASKS = {
         "stage1_spatial": torch.tensor([True, True, True, True, False, False, False, False, False, False], dtype=torch.bool, device=DEVICE),
@@ -548,18 +548,18 @@ def main():
 
     TOTAL_GENERATIONS = sum(gens for _, gens in CURRICULUM)
 
-    # Seed with the verified Underwater Baseline Genome (0.150 m/s, 24.5 N peak, CoT 0.20)
+    # Seed with the verified Underwater Champion Genome (0.144 m/s, 21.6 N peak, CoT 0.16)
     current_champion_genome = torch.tensor([
-        0.00224,  # l2_clearance
-        0.6437,   # k1_stride_gain
-        0.0611,   # k2_stance_gain
-        0.9433,   # k3_vertical_gain
-        0.5000,   # epsilon_duty_factor
-        1.2000,   # total_period_T 
-        0.4048,   # coupling_strength_w
-        3.3590,   # sigmoid_slope_b
-        3.2000,   # f_touch_td (underwater scaled)
-        0.5000    # f_release_rel (underwater scaled)
+        0.00200,  # l2_clearance
+        0.55475,   # k1_stride_gain
+        0.11106,   # k2_stance_gain
+        0.80386,   # k3_vertical_gain
+        0.49081,   # epsilon_duty_factor
+        1.17118,   # total_period_T 
+        0.65987,   # coupling_strength_w
+        3.16319,   # sigmoid_slope_b
+        5.00882,   # f_touch_td
+        0.21571    # f_release_rel
     ], device=DEVICE)
 
     best_overall_fitness = -float("inf")
@@ -620,12 +620,19 @@ def main():
             start_pos = settled_root_pos.clone()
             peak_impact_forces = torch.zeros(num_envs, device=DEVICE)
             total_energy = torch.zeros(num_envs, device=DEVICE)
+            torque_sq_accum = torch.zeros(num_envs, device=DEVICE)
             sum_fz_accum = torch.zeros(num_envs, device=DEVICE)
             post_ramp_steps = 0
+
+            cmd_theta = torch.as_tensor(DIRECTION, device=DEVICE, dtype=torch.float32)
+            cos_theta = torch.cos(cmd_theta)
+            sin_theta = torch.sin(cmd_theta)
     
             root_z_buf = torch.empty((NUM_CPG_STEPS, num_envs), device=DEVICE)
             root_tilt_buf = torch.empty((NUM_CPG_STEPS, num_envs), device=DEVICE)
-    
+            root_yaw_buf = torch.empty((NUM_CPG_STEPS, num_envs), device=DEVICE)
+            path_drift_buf = torch.empty((NUM_CPG_STEPS, num_envs), device=DEVICE)
+
             accumulated_forces = torch.zeros((num_feet_total, 3), device=DEVICE)
             filtered_forces = torch.zeros((num_feet_total, 3), device=DEVICE)
 
@@ -659,6 +666,19 @@ def main():
                     root_z_buf[cpg_idx] = curr_root_pos[:, 2]
                     root_tilt_buf[cpg_idx] = 2.0 * (curr_root_rot[:, 1]**2 + curr_root_rot[:, 2]**2)
 
+                    # Relative quaternion z-component (q_init^-1 * q_curr)_z for pure yaw deviation
+                    q_rel_z = (
+                        settled_root_rot[:, 0] * curr_root_rot[:, 3]
+                        - settled_root_rot[:, 1] * curr_root_rot[:, 2]
+                        + settled_root_rot[:, 2] * curr_root_rot[:, 1]
+                        - settled_root_rot[:, 3] * curr_root_rot[:, 0]
+                    )
+                    root_yaw_buf[cpg_idx] = 2.0 * (q_rel_z ** 2)
+
+                    step_dx = curr_root_pos[:, 0] - start_pos[:, 0]
+                    step_dy = curr_root_pos[:, 1] - start_pos[:, 1]
+                    path_drift_buf[cpg_idx] = torch.abs(step_dx * sin_theta - step_dy * cos_theta)
+
                 # B. Apply Hydrodynamic Forces and CPG Joint Targets
                 last_linear_velocity, last_angular_velocity = apply_hydrodynamics_step(
                     last_linear_velocity, last_angular_velocity
@@ -687,6 +707,7 @@ def main():
                 )
                 step_power = torch.sum(torch.abs(tau_efforts * q_vels), dim=-1)
                 total_energy += step_power * SIM_DT
+                torque_sq_accum += torch.mean(tau_efforts ** 2, dim=-1) * SIM_DT
 
                 # F. Filtered Peak Impact & Benthic Normal Load Capture (post-ramp)
                 if step >= RAMP_STEPS:
@@ -708,34 +729,42 @@ def main():
 
             eval_time_s = STEPS_PER_EVAL * SIM_DT
 
-            cmd_theta = torch.as_tensor(DIRECTION, device=DEVICE, dtype=torch.float32)
-            cos_theta = torch.cos(cmd_theta)
-            sin_theta = torch.sin(cmd_theta)
-
             target_displacement = delta_x * cos_theta + delta_y * sin_theta
             cross_track_drift = torch.abs(delta_x * sin_theta - delta_y * cos_theta)
+            mean_path_drift = torch.mean(path_drift_buf, dim=0)
             v_target = target_displacement / eval_time_s
 
             safe_disp = torch.clamp(target_displacement, min=0.02)
             drift_ratio = torch.clamp(cross_track_drift / safe_disp, max=2.0)
             cost_of_transport = total_energy / (ROBOT_WEIGHT * safe_disp)
+            rms_joint_torque = torch.sqrt(torque_sq_accum / eval_time_s)
 
             sigma_height = torch.std(root_z_buf, dim=0)
             mean_height_drift = torch.abs(torch.mean(root_z_buf, dim=0) - settled_root_pos[:, 2])
             mean_tilt = torch.mean(root_tilt_buf, dim=0)
-            chassis_variability = sigma_height + mean_height_drift + mean_tilt
+            mean_yaw_err = torch.mean(root_yaw_buf, dim=0)
+            chassis_variability = sigma_height + mean_height_drift + mean_tilt + 2.0 * mean_yaw_err
 
             # 1. Speed Reward (Saturates at 0.20 m/s)
-            speed_reward = 10.0 * torch.clamp(v_target, min=0.0, max=0.20)
-            drift_penalty = 1.0 * drift_ratio
+            speed_reward = 12.0 * torch.clamp(v_target, min=0.0, max=0.20)
+            drift_penalty = torch.clamp(
+                12.0 * cross_track_drift + 10.0 * mean_path_drift + 4.0 * drift_ratio + 60.0 * mean_yaw_err,
+                max=4.0
+            )
 
-            # 2. Underwater CoT Penalty (Baseline is ~0.20; penalize CoT > 0.18 + continuous gradient)
+            # 2. Underwater CoT & Joint Torque Smoothness Penalty
             cot_excess = torch.clamp(cost_of_transport - 0.18, min=0.0)
-            cot_penalty = torch.clamp(0.5 * cost_of_transport + cot_excess * 4.0, max=5.0)
+            cot_penalty = torch.clamp(
+                0.5 * cost_of_transport + cot_excess * 3.5 + 0.25 * rms_joint_torque,
+                max=5.0
+            )
 
             # 3. Underwater Impact Penalty (Baseline filtered peak is ~24.5 N; penalize > 22.0 N)
-            excess_force = torch.clamp(peak_impact_forces - 22.0, min=0.0)
-            impact_penalty = torch.clamp((excess_force / 10.0) ** 1.5, max=5.0)
+            excess_force = torch.clamp(peak_impact_forces - 18.5, min=0.0)
+            impact_penalty = torch.clamp(
+                0.04 * (peak_impact_forces - 15.0).clamp(min=0.0) + (excess_force / 6.0) ** 1.5,
+                max=5.0
+            )
 
             # 4. Benthic Traction / Unloading Penalty (Expected Sum Fz ≈ 17.1 N; penalize < 12.0 N floating/hopping)
             mean_sum_fz = sum_fz_accum / float(max(1, post_ramp_steps))
@@ -743,8 +772,8 @@ def main():
             benthic_penalty = torch.clamp(unloading_deficit * 0.4, max=3.0)
 
             # 5. Stability & Stall Penalties
-            chassis_variability_penalty = torch.clamp(chassis_variability * 35.0, max=2.5)
-            stall_mask = (target_displacement < 0.15).float()
+            chassis_variability_penalty = torch.clamp(chassis_variability * 40.0, max=2.5)
+            stall_mask = (target_displacement < 0.25).float()
             stall_penalty = stall_mask * 6.0
 
             fitness = (

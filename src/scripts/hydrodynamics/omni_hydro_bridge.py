@@ -102,7 +102,7 @@ CPG_STEP_HEIGHT = 0.025
 CPG_GAIT_PERIOD = 1.350
 # m/s
 CMD_VX = 0.000
-CMD_VY = 0.208
+CMD_VY = 0.200
 # rad/s
 CMD_WZ = 0.000
 
@@ -370,14 +370,20 @@ def main():
         should_render = RENDER_SIMULATION and ((settle_step + 1) % RENDER_INTERVAL == 0)
         world.step(render=should_render)
 
+    # Capture the verified settled base poses and joint states
+    settled_pos, settled_rot = robot_view.get_world_poses(clone=True)
+    print(f"[INFO] Settling complete. Base Z: {settled_pos[0, 2]:.4f} m. State buffers established.")
+
     # Locomotion Variables
-    root_poses, _ = robot_view.get_world_poses()
-    start_pos = root_poses[0].clone()
-    peak_impact_n = 0.0
+    start_pos = settled_pos[0].clone()
+
     phase_normalized = 0.0
+    peak_impact_n = 0.0
     total_energy = 0.0
     tilt_samples = []
     z_force_history = []
+    z_samples = []
+    yaw_samples = []
 
     # Filter buffers (6 feet, 3 axes)
     accumulated_forces = torch.zeros((6, 3), device=DEVICE)
@@ -427,9 +433,18 @@ def main():
                 filtered_forces = 0.8 * filtered_forces + 0.2 * mean_forces[feet_to_canonical]
 
             # Stability Telemetry
-            _, curr_rot = robot_view.get_world_poses(clone=False)
+            curr_pos, curr_rot = robot_view.get_world_poses(clone=False)
             tilt = float(2.0 * (curr_rot[0, 1]**2 + curr_rot[0, 2]**2))
             tilt_samples.append(tilt)
+            z_samples.append(float(curr_pos[0, 2].item()))
+
+            q_rel_z = float(
+                settled_rot[0, 0] * curr_rot[0, 3]
+                - settled_rot[0, 1] * curr_rot[0, 2]
+                + settled_rot[0, 2] * curr_rot[0, 1]
+                - settled_rot[0, 3] * curr_rot[0, 0]
+            )
+            yaw_samples.append(2.0 * (q_rel_z ** 2))
 
         # B. Apply Hydrodynamic Forces
         last_linear_velocity, last_angular_velocity = apply_hydrodynamics_step(
@@ -453,7 +468,7 @@ def main():
 
         # Accumulate forces for locomotion filtering
         accumulated_forces += continuous_forces
-
+        
         tau_efforts = torch.clamp(
             joint_kps * (newton_targets - q_curr) - joint_kds * q_vels,
             -MAX_TORQUE,
@@ -491,6 +506,13 @@ def main():
     safe_disp = max(0.02, total_planar_dist)
     cost_of_transport = total_energy / (ROBOT_WEIGHT * safe_disp)
     mean_sum_fz = float(np.mean(z_force_history)) if z_force_history else 0.0
+
+    sigma_height = float(np.std(z_samples)) if z_samples else 0.0
+    mean_height_drift = abs(float(np.mean(z_samples)) - float(settled_pos[0, 2].item())) if z_samples else 0.0
+    mean_tilt = float(np.mean(tilt_samples)) if tilt_samples else 0.0
+    mean_yaw_err = float(np.mean(yaw_samples)) if yaw_samples else 0.0
+    chassis_variability = sigma_height + mean_height_drift + mean_tilt + 2.0 * mean_yaw_err
+    
     
     print("\n" + "=" * 85, flush=True)
     print("OMNIDIRECTIONAL MODEL-BASED GAIT BENCHMARK SUMMARY", flush=True)
@@ -507,6 +529,7 @@ def main():
     print(f"Total Mechanical Energy       : {total_energy:.2f} J", flush=True)
     print(f"Peak Impact Force             : {peak_impact_n:.1f} N", flush=True)
     print(f"Mean Chassis Tilt             : {mean_tilt:.4f}", flush=True)
+    print(f"Chassis Variability           : {chassis_variability:.5f} (Z_std: {sigma_height:.4f} m, Yaw_err: {mean_yaw_err:.5f})", flush=True)
     print(f"Mean Total Vertical Load (Fz) : {mean_sum_fz:.2f} N (Static W_sub: 20.54 N)", flush=True)
     print("=" * 85 + "\n", flush=True)
         

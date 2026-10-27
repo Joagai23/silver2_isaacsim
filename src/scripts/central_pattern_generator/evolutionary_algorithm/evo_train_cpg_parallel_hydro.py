@@ -100,9 +100,9 @@ MAX_PHYS_ACCEL = 20.0
 RAMP_STEPS = 210
 ROBOT_WEIGHT = SILVER2_TOTAL_MASS * 9.81
 
-STRIDE_FWD_CMD = 0.005
-STRIDE_LAT_CMD = 0.010
-DIRECTION = SILVER2_DIRECTION_MAP["right"]
+STRIDE_FWD_CMD = 0.010
+STRIDE_LAT_CMD = 0.005
+DIRECTION = SILVER2_DIRECTION_MAP["forward"]
 
 # --------------------------------------------------------------------------
 # Checkpoint & Telemetry Paths

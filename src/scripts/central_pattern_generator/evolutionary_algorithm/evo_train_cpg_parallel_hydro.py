@@ -101,8 +101,8 @@ RAMP_STEPS = 210
 ROBOT_WEIGHT = SILVER2_TOTAL_MASS * 9.81
 
 STRIDE_FWD_CMD = 0.010
-STRIDE_LAT_CMD = 0.005
-DIRECTION = SILVER2_DIRECTION_MAP["forward"]
+STRIDE_LAT_CMD = 0.010
+DIRECTION = SILVER2_DIRECTION_MAP["right"]
 
 # --------------------------------------------------------------------------
 # Checkpoint & Telemetry Paths
@@ -223,7 +223,7 @@ def audit_and_repair_all_drives(stage, envs_scope_path="/World/env"):
                 else:
                     prim.GetAttribute("physics:contactReport").Set(True)
 
-def setup_newton_scene(stage, physics_scene_path="/physicsScene"):
+def setup_newton_scene(stage, physics_scene_path="/physicsScene", nconmax=16384, njmax=16384):
     """Configures USD PhysicsScene prim attributes for Newton GPU execution."""
     scene_prim = stage.GetPrimAtPath(physics_scene_path)
     if not scene_prim.IsValid():
@@ -238,6 +238,16 @@ def setup_newton_scene(stage, physics_scene_path="/physicsScene"):
         scene_prim.GetAttribute("physics:engine").Set("Newton")
     else:
         scene_prim.CreateAttribute("physics:engine", Sdf.ValueTypeNames.Token).Set("Newton")
+
+    for attr_name, val in [
+        ("newton:nconmax", nconmax),
+        ("newton:njmax", njmax),
+        ("physxScene:gpuMaxRigidContactCount", nconmax),
+    ]:
+        if scene_prim.HasAttribute(attr_name):
+            scene_prim.GetAttribute(attr_name).Set(int(val))
+        else:
+            scene_prim.CreateAttribute(attr_name, Sdf.ValueTypeNames.Int).Set(int(val))
 
 def get_population_link_paths(stage, target_robot_paths="/World/env"):
     """Discovers all rigid-body link prim paths across all parallel robot instances."""
@@ -260,7 +270,7 @@ def main():
 
     stage = get_current_stage()
     audit_and_repair_all_drives(stage, envs_scope_path="/World/env")
-    setup_newton_scene(stage, "/physicsScene")
+    setup_newton_scene(stage, "/physicsScene", nconmax=8064, njmax=10752)
     SimulationManager.switch_physics_engine("newton")
     
     # Discover Robots under /World/env
@@ -317,9 +327,8 @@ def main():
 
     ns = newton_ext.acquire_stage()
     if ns is not None:
-        ns.cfg.solver_cfg.nconmax = 10560
-        ns.cfg.solver_cfg.njmax = 12000
-        
+        ns.cfg.solver_cfg.nconmax = 8064
+        ns.cfg.solver_cfg.njmax = 10752
         if hasattr(ns.cfg.solver_cfg, "num_iterations"):
             ns.cfg.solver_cfg.num_iterations = 32
         if hasattr(ns.cfg.solver_cfg, "num_ls_iterations"):
@@ -529,8 +538,8 @@ def main():
     # 7. Evolutionary Optimization (10 Parameters)
     # Genome: [l2, k1, k2, k3, epsilon, total_period, coupling_strength, b, f_touch, f_release]
     # --------------------------------------------------------------------------
-    GENOME_MIN_WIDE = torch.tensor([0.001, 0.45, 0.00, 0.72, 0.44, 0.90, 0.15, 1.5, 1.80, 0.20], device=DEVICE)
-    GENOME_MAX_WIDE = torch.tensor([0.020, 1.25, 0.12, 1.15, 0.72, 2.50, 0.90, 5.0, 6.50, 1.50], device=DEVICE)
+    GENOME_MIN_WIDE = torch.tensor([0.005, 0.45, 0.00, 1.00, 0.44, 0.90, 0.15, 1.5, 1.80, 0.20], device=DEVICE)
+    GENOME_MAX_WIDE = torch.tensor([0.015, 1.15, 0.04, 1.25, 0.72, 2.50, 0.90, 5.0, 6.50, 1.50], device=DEVICE)
 
     CURRICULUM_MASKS = {
         "stage1_spatial": torch.tensor([True, True, True, True, False, False, False, False, False, False], dtype=torch.bool, device=DEVICE),
@@ -548,18 +557,18 @@ def main():
 
     TOTAL_GENERATIONS = sum(gens for _, gens in CURRICULUM)
 
-    # Seed with the verified Underwater Champion Genome (0.144 m/s, 21.6 N peak, CoT 0.16)
+    # Seed with Baseline Genome
     current_champion_genome = torch.tensor([
-        0.00200,  # l2_clearance
-        0.55475,   # k1_stride_gain
-        0.11106,   # k2_stance_gain
-        0.80386,   # k3_vertical_gain
-        0.49081,   # epsilon_duty_factor
-        1.17118,   # total_period_T 
-        0.65987,   # coupling_strength_w
-        3.16319,   # sigmoid_slope_b
-        5.00882,   # f_touch_td
-        0.21571    # f_release_rel
+        0.0050,  # l2_clearance
+        0.6000,  # k1_stride_gain
+        0.0200,  # k2_stance_gain
+        1.0000,  # k3_vertical_gain
+        0.4800,  # epsilon_duty_factor
+        1.2500,  # total_period_T
+        0.6000,  # coupling_strength_w
+        3.2000,  # sigmoid_slope_b
+        3.2000,  # f_touch_td
+        0.8000   # f_release_rel
     ], device=DEVICE)
 
     best_overall_fitness = -float("inf")
@@ -581,20 +590,25 @@ def main():
         frozen_mask = ~active_mask
         stage_best_fitness = -float("inf")
 
-        # Select dynamic bounds based on active curriculum stage
-        if "fine_tuning" in stage_name:
-            span = (GENOME_MAX_WIDE - GENOME_MIN_WIDE) * 0.15
-            bounds_min = torch.max(GENOME_MIN_WIDE, current_champion_genome - span)
-            bounds_max = torch.min(GENOME_MAX_WIDE, current_champion_genome + span)
-        else:
-            bounds_min = GENOME_MIN_WIDE
-            bounds_max = GENOME_MAX_WIDE
+        # Select mutation scale based on active curriculum stage
+        bounds_min = GENOME_MIN_WIDE
+        bounds_max = GENOME_MAX_WIDE
+        is_fine_tuning = "fine_tuning" in stage_name
+        init_span_scale = 0.20 if is_fine_tuning else 1.00
+        mut_stage_scale = 0.40 if is_fine_tuning else 1.00
 
         # Initialize stage population seeded around the latest champion
         population = current_champion_genome.repeat(num_envs, 1)
         if active_mask.any():
-            random_noise = bounds_min + torch.rand((num_envs, 10), device=DEVICE) * (bounds_max - bounds_min)
-            population = torch.where(active_mask.unsqueeze(0), random_noise, population)
+            if is_fine_tuning:
+                # Local Gaussian/uniform ball around champion for Stage 4 fine-tuning
+                half_span = (bounds_max - bounds_min) * init_span_scale
+                local_min = torch.max(bounds_min, current_champion_genome - half_span)
+                local_max = torch.min(bounds_max, current_champion_genome + half_span)
+                random_init = local_min + torch.rand((num_envs, 10), device=DEVICE) * (local_max - local_min)
+            else:
+                random_init = bounds_min + torch.rand((num_envs, 10), device=DEVICE) * (bounds_max - bounds_min)
+            population = torch.where(active_mask.unsqueeze(0), random_init, population)
 
         population[0] = current_champion_genome.clone()
         cpg_controller.set_population_genomes(population)
@@ -759,11 +773,11 @@ def main():
                 max=5.0
             )
 
-            # 3. Underwater Impact Penalty (Baseline filtered peak is ~24.5 N; penalize > 22.0 N)
-            excess_force = torch.clamp(peak_impact_forces - 18.5, min=0.0)
+            # 3. Underwater Impact Penalty
+            excess_force = torch.clamp(peak_impact_forces - 22.0, min=0.0)
             impact_penalty = torch.clamp(
-                0.04 * (peak_impact_forces - 15.0).clamp(min=0.0) + (excess_force / 6.0) ** 1.5,
-                max=5.0
+                0.04 * (peak_impact_forces - 16.0).clamp(min=0.0) + (excess_force / 10.0) ** 1.5,
+                max=6.0
             )
 
             # 4. Benthic Traction / Unloading Penalty (Expected Sum Fz ≈ 17.1 N; penalize < 12.0 N floating/hopping)
@@ -834,33 +848,57 @@ def main():
             )
 
             # ----------------------------------------------------------------------
-            # Genetic Operations: Crossover, Mutation & Elitism
+            # Genetic Operations: Crossover, Mutation & Elitism (32 / 64 Envs)
             # ----------------------------------------------------------------------
             if active_mask.any():
-                k_elites = 2
+                k_elites = max(3, num_envs // 16)
+                n_aliens = max(2, num_envs // 16)
                 _, elite_indices = torch.topk(fitness, k=k_elites)
                 elites = population[elite_indices].clone()
 
+                # Binary Tournament Selection for Parent A and distinct Parent B
                 p1 = torch.randint(0, num_envs, (num_envs,), device=DEVICE)
                 p2 = torch.randint(0, num_envs, (num_envs,), device=DEVICE)
-                parent_a = torch.where((fitness[p1] > fitness[p2]).unsqueeze(1), population[p1], population[p2])
+                idx_a = torch.where(fitness[p1] > fitness[p2], p1, p2)
 
                 p3 = torch.randint(0, num_envs, (num_envs,), device=DEVICE)
                 p4 = torch.randint(0, num_envs, (num_envs,), device=DEVICE)
-                parent_b = torch.where((fitness[p3] > fitness[p4]).unsqueeze(1), population[p3], population[p4])
+                idx_b = torch.where(fitness[p3] > fitness[p4], p3, p4)
+                # Prevent self-mating (idx_a == idx_b)
+                idx_b = torch.where(idx_a == idx_b, (idx_b + 1) % num_envs, idx_b)
 
+                parent_a = population[idx_a]
+                parent_b = population[idx_b]
+
+                # BLX-0.2 Blend Crossover
                 num_genes = population.shape[1]
                 blend_weights = torch.rand((num_envs, num_genes), device=DEVICE) * 1.4 - 0.20
                 crossed_offspring = blend_weights * parent_a + (1.0 - blend_weights) * parent_b
 
-                mutation_rate = max(0.02, 0.06 * (1.0 - (stage_gen + 1) / stage_generations))
+                # Cosine-annealed mutation rate across the full stage (0.08 -> 0.015)
+                progress = float(stage_gen + 1) / float(stage_generations)
+                base_mut = 0.015 + 0.5 * (0.08 - 0.015) * (1.0 + float(np.cos(np.pi * progress)))
+                mutation_rate = base_mut * mut_stage_scale
+
                 raw_noise = torch.randn_like(crossed_offspring) * (bounds_max - bounds_min) * mutation_rate
                 masked_noise = raw_noise * active_mask.float().unsqueeze(0)
-
                 offspring = torch.clamp(crossed_offspring + masked_noise, bounds_min, bounds_max)
+
+                # Inject wide-exploration aliens in slots [-n_aliens:]
+                alien_noise = torch.randn((n_aliens, num_genes), device=DEVICE) * (bounds_max - bounds_min) * (mutation_rate * 2.5)
+                aliens = torch.clamp(
+                    current_champion_genome.unsqueeze(0) + alien_noise * active_mask.float().unsqueeze(0),
+                    bounds_min,
+                    bounds_max
+                )
+                offspring[-n_aliens:] = aliens
+
+                # Lock frozen curriculum genes and preserve stage champion + current top elites
                 if frozen_mask.any():
                     offspring[:, frozen_mask] = current_champion_genome[frozen_mask]
-                offspring[:k_elites] = elites
+                offspring[0] = current_champion_genome.clone()
+                offspring[1:k_elites] = elites[:k_elites - 1]
+
                 population = offspring
                 cpg_controller.set_population_genomes(population)
 

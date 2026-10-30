@@ -370,3 +370,36 @@ class WarpHexapodCPGController:
             ],
             device=self.device
         )
+
+    def update_parameters(
+        self,
+        total_period: Optional[float] = None,
+        epsilon: Optional[float] = None,
+        k1: Optional[float] = None,
+        k2: Optional[float] = None,
+        k3: Optional[float] = None,
+        l2: Optional[float] = None,
+        coupling_strength: Optional[float] = None,
+        b: Optional[float] = None,
+        f_touch: Optional[float] = None,
+        f_release: Optional[float] = None,
+    ):
+        """
+        Safely updates active genome parameters after initialization and 
+        recomputes dependent oscillator frequencies.
+        """
+        if total_period is not None: self.total_period = float(total_period)
+        if epsilon is not None: self.epsilon = float(epsilon)
+        if k1 is not None: self.k1 = float(k1)
+        if k2 is not None: self.k2 = float(k2)
+        if k3 is not None: self.k3 = float(k3)
+        if l2 is not None: self.l2 = float(l2)
+        if coupling_strength is not None: self.coupling_strength = float(coupling_strength)
+        if b is not None: self.b = float(b)
+        if f_touch is not None: self.f_touch = float(f_touch)
+        if f_release is not None: self.f_release = float(f_release)
+
+        # Recompute dependent phase frequencies (Eq. 2 [3])
+        self.omega_swing = float(np.pi / ((1.0 - self.epsilon) * self.total_period))
+        self.omega_stance = float(np.pi / (self.epsilon * self.total_period))
+        self.delta_omega = self.omega_stance - self.omega_swing

@@ -538,6 +538,7 @@ def main():
     # 7. Evolutionary Optimization (10 Parameters)
     # Genome: [l2, k1, k2, k3, epsilon, total_period, coupling_strength, b, f_touch, f_release]
     # --------------------------------------------------------------------------
+    """
     GENOME_MIN_WIDE = torch.tensor([0.005, 0.45, 0.00, 1.00, 0.44, 0.90, 0.15, 1.5, 1.80, 0.20], device=DEVICE)
     GENOME_MAX_WIDE = torch.tensor([0.015, 1.15, 0.04, 1.25, 0.72, 2.50, 0.90, 5.0, 6.50, 1.50], device=DEVICE)
 
@@ -554,21 +555,42 @@ def main():
         ("stage3_sensory",     60),
         ("stage4_fine_tuning", 120),
     ]
+    """
+    GENOME_MIN_WIDE = torch.tensor([0.005, 0.50, 0.00, 1.00, 0.42, 1.05, 0.15, 1.5, 1.80, 0.20], device=DEVICE)
+    GENOME_MAX_WIDE = torch.tensor([0.012, 1.15, 0.04, 1.20, 0.68, 2.20, 0.90, 5.5, 6.50, 1.50], device=DEVICE)
+
+    CURRICULUM_MASKS = {
+        # Co-optimize spatial stride (l2, k1, k2, k3) AND cadence (epsilon, T) together!
+        "stage1_propulsion":    torch.tensor([True,  True,  True,  True,  True,  True,  False, False, False, False], dtype=torch.bool, device=DEVICE),
+        # Refine oscillator coupling & transition sharpness alongside timing
+        "stage2_oscillator":    torch.tensor([False, False, False, False, True,  True,  True,  True,  False, False], dtype=torch.bool, device=DEVICE),
+        # Tune sensory force feedback thresholds
+        "stage3_sensory":       torch.tensor([False, False, False, False, False, False, False, False, True,  True ], dtype=torch.bool, device=DEVICE),
+        # Full 10-DOF joint polish
+        "stage4_global_polish": torch.tensor([True] * 10, dtype=torch.bool, device=DEVICE),
+    }
+
+    CURRICULUM = [
+        ("stage1_propulsion",    120),
+        ("stage2_oscillator",    120),
+        ("stage3_sensory",        60),
+        ("stage4_global_polish", 120),
+    ]
 
     TOTAL_GENERATIONS = sum(gens for _, gens in CURRICULUM)
 
     # Seed with Baseline Genome
     current_champion_genome = torch.tensor([
-        0.0050,  # l2_clearance
-        0.6000,  # k1_stride_gain
-        0.0200,  # k2_stance_gain
-        1.0000,  # k3_vertical_gain
-        0.4800,  # epsilon_duty_factor
-        1.2500,  # total_period_T
-        0.6000,  # coupling_strength_w
-        3.2000,  # sigmoid_slope_b
-        3.2000,  # f_touch_td
-        0.8000   # f_release_rel
+        0.00500,  # l2_clearance
+        0.66321,  # k1_stride_gain
+        0.00891,  # k2_stance_gain
+        1.00367,  # k3_vertical_gain
+        0.49567,  # epsilon_duty_factor
+        2.15000,  # total_period_T
+        0.48475,  # coupling_strength_w
+        3.97389,  # sigmoid_slope_b
+        6.25987,  # f_touch_td
+        1.08627   # f_release_rel
     ], device=DEVICE)
 
     best_overall_fitness = -float("inf")
@@ -593,21 +615,25 @@ def main():
         # Select mutation scale based on active curriculum stage
         bounds_min = GENOME_MIN_WIDE
         bounds_max = GENOME_MAX_WIDE
-        is_fine_tuning = "fine_tuning" in stage_name
-        init_span_scale = 0.20 if is_fine_tuning else 1.00
-        mut_stage_scale = 0.40 if is_fine_tuning else 1.00
+        is_fine_tuning = "polish" in stage_name
+        init_span_scale = 0.30 if is_fine_tuning else 1.00
+        mut_stage_scale = 0.60 if is_fine_tuning else 1.00
 
         # Initialize stage population seeded around the latest champion
         population = current_champion_genome.repeat(num_envs, 1)
         if active_mask.any():
+            half_span = (bounds_max - bounds_min) * (0.25 if not is_fine_tuning else init_span_scale)
+            local_min = torch.max(bounds_min, current_champion_genome - half_span)
+            local_max = torch.min(bounds_max, current_champion_genome + half_span)
+            local_init = local_min + torch.rand((num_envs, 10), device=DEVICE) * (local_max - local_min)
+
             if is_fine_tuning:
-                # Local Gaussian/uniform ball around champion for Stage 4 fine-tuning
-                half_span = (bounds_max - bounds_min) * init_span_scale
-                local_min = torch.max(bounds_min, current_champion_genome - half_span)
-                local_max = torch.min(bounds_max, current_champion_genome + half_span)
-                random_init = local_min + torch.rand((num_envs, 10), device=DEVICE) * (local_max - local_min)
+                random_init = local_init
             else:
-                random_init = bounds_min + torch.rand((num_envs, 10), device=DEVICE) * (bounds_max - bounds_min)
+                global_init = bounds_min + torch.rand((num_envs, 10), device=DEVICE) * (bounds_max - bounds_min)
+                split = num_envs // 2
+                random_init = torch.cat([local_init[:split], global_init[split:]], dim=0)
+
             population = torch.where(active_mask.unsqueeze(0), random_init, population)
 
         population[0] = current_champion_genome.clone()
@@ -760,34 +786,34 @@ def main():
             chassis_variability = sigma_height + mean_height_drift + mean_tilt + 2.0 * mean_yaw_err
 
             # 1. Speed Reward (Saturates at 0.20 m/s)
-            speed_reward = 12.0 * torch.clamp(v_target, min=0.0, max=0.20)
+            speed_reward = 16.0 * torch.clamp(v_target, min=0.0, max=0.20)
             drift_penalty = torch.clamp(
                 12.0 * cross_track_drift + 10.0 * mean_path_drift + 4.0 * drift_ratio + 60.0 * mean_yaw_err,
                 max=4.0
             )
 
             # 2. Underwater CoT & Joint Torque Smoothness Penalty
-            cot_excess = torch.clamp(cost_of_transport - 0.18, min=0.0)
+            cot_excess = torch.clamp(cost_of_transport - 0.22, min=0.0)
             cot_penalty = torch.clamp(
-                0.5 * cost_of_transport + cot_excess * 3.5 + 0.25 * rms_joint_torque,
+                0.45 * cost_of_transport + cot_excess * 3.0 + 0.22 * rms_joint_torque,
                 max=5.0
             )
 
             # 3. Underwater Impact Penalty
             excess_force = torch.clamp(peak_impact_forces - 22.0, min=0.0)
             impact_penalty = torch.clamp(
-                0.04 * (peak_impact_forces - 16.0).clamp(min=0.0) + (excess_force / 10.0) ** 1.5,
+                0.035 * (peak_impact_forces - 17.5).clamp(min=0.0) + (excess_force / 9.0) ** 1.5,
                 max=6.0
             )
 
-            # 4. Benthic Traction / Unloading Penalty (Expected Sum Fz ≈ 17.1 N; penalize < 12.0 N floating/hopping)
+            # 4. Benthic Traction / Unloading Penalty
             mean_sum_fz = sum_fz_accum / float(max(1, post_ramp_steps))
             unloading_deficit = torch.clamp(12.0 - mean_sum_fz, min=0.0)
             benthic_penalty = torch.clamp(unloading_deficit * 0.4, max=3.0)
 
             # 5. Stability & Stall Penalties
             chassis_variability_penalty = torch.clamp(chassis_variability * 40.0, max=2.5)
-            stall_mask = (target_displacement < 0.25).float()
+            stall_mask = (target_displacement < 0.30).float()
             stall_penalty = stall_mask * 6.0
 
             fitness = (

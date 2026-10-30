@@ -98,11 +98,11 @@ DECIMATION_RATIO = 4
 CTRL_DT = SIM_DT * DECIMATION_RATIO
 TARGET_SPEED = 0.200
 
-CPG_STEP_HEIGHT = 0.025
-CPG_GAIT_PERIOD = 1.350
+CPG_STEP_HEIGHT = 0.0502
+CPG_GAIT_PERIOD = 1.99355
 # m/s
 CMD_VX = 0.000
-CMD_VY = 0.200
+CMD_VY = -0.200
 # rad/s
 CMD_WZ = 0.000
 
@@ -376,11 +376,12 @@ def main():
 
     # Locomotion Variables
     start_pos = settled_pos[0].clone()
-
     phase_normalized = 0.0
+
     peak_impact_n = 0.0
     total_energy = 0.0
     tilt_samples = []
+    tilt_deg_samples = []
     z_force_history = []
     z_samples = []
     yaw_samples = []
@@ -432,18 +433,26 @@ def main():
                 accumulated_forces.zero_()
                 filtered_forces = 0.8 * filtered_forces + 0.2 * mean_forces[feet_to_canonical]
 
-            # Stability Telemetry
+            # Stability Telemetry (Relative to settled underwater stance: q_rel = q_settled^-1 * q_curr)
             curr_pos, curr_rot = robot_view.get_world_poses(clone=False)
-            tilt = float(2.0 * (curr_rot[0, 1]**2 + curr_rot[0, 2]**2))
-            tilt_samples.append(tilt)
-            z_samples.append(float(curr_pos[0, 2].item()))
+            w0, x0, y0, z0 = settled_rot[0, 0], settled_rot[0, 1], settled_rot[0, 2], settled_rot[0, 3]
+            w1, x1, y1, z1 = curr_rot[0, 0], curr_rot[0, 1], curr_rot[0, 2], curr_rot[0, 3]
 
-            q_rel_z = float(
-                settled_rot[0, 0] * curr_rot[0, 3]
-                - settled_rot[0, 1] * curr_rot[0, 2]
-                + settled_rot[0, 2] * curr_rot[0, 1]
-                - settled_rot[0, 3] * curr_rot[0, 0]
-            )
+            # Relative quaternion components (Hamilton product: q_0^* * q_1)
+            q_rel_x = float(w0 * x1 - x0 * w1 - y0 * z1 + z0 * y1)
+            q_rel_y = float(w0 * y1 + x0 * z1 - y0 * w1 - z0 * x1)
+            q_rel_z = float(w0 * z1 - x0 * y1 + y0 * x1 - z0 * w1)
+
+            # Quadratic tilt metric (1 - cos(theta_tilt)) for fitness parity
+            tilt_quad = 2.0 * (q_rel_x ** 2 + q_rel_y ** 2)
+            tilt_samples.append(tilt_quad)
+
+            # True physical tilt angle in radians and degrees for human-readable telemetry
+            sin_half_tilt = min(1.0, float(np.sqrt(q_rel_x ** 2 + q_rel_y ** 2)))
+            tilt_rad = 2.0 * float(np.arcsin(sin_half_tilt))
+            tilt_deg_samples.append(float(np.rad2deg(tilt_rad)))
+
+            z_samples.append(float(curr_pos[0, 2].item()))
             yaw_samples.append(2.0 * (q_rel_z ** 2))
 
         # B. Apply Hydrodynamic Forces
@@ -496,12 +505,10 @@ def main():
 
     mean_planar_velocity = total_planar_dist / TEST_DURATION_S
     trajectory_heading_deg = float(np.rad2deg(np.arctan2(dy, dx)))
-    mean_tilt = float(np.mean(tilt_samples)) if tilt_samples else 0.0
-
     cmd_speed = math.hypot(CMD_VX, CMD_VY)
-    cmd_heading_deg = float(np.rad2deg(np.arctan2(CMD_VY, CMD_VX))) if cmd_speed > 1e-4 else 0.0
     vel_tracking_ratio = (mean_planar_velocity / cmd_speed * 100.0) if cmd_speed > 1e-4 else 0.0
-    
+    cmd_heading_deg = float(np.rad2deg(np.arctan2(CMD_VY, CMD_VX))) if cmd_speed > 1e-4 else 0.0
+        
     # Energetics & Cost of Transport
     safe_disp = max(0.02, total_planar_dist)
     cost_of_transport = total_energy / (ROBOT_WEIGHT * safe_disp)
@@ -509,7 +516,11 @@ def main():
 
     sigma_height = float(np.std(z_samples)) if z_samples else 0.0
     mean_height_drift = abs(float(np.mean(z_samples)) - float(settled_pos[0, 2].item())) if z_samples else 0.0
+    
     mean_tilt = float(np.mean(tilt_samples)) if tilt_samples else 0.0
+    mean_tilt_deg = float(np.mean(tilt_deg_samples)) if tilt_deg_samples else 0.0
+    max_tilt_deg = float(np.max(tilt_deg_samples)) if tilt_deg_samples else 0.0
+    
     mean_yaw_err = float(np.mean(yaw_samples)) if yaw_samples else 0.0
     chassis_variability = sigma_height + mean_height_drift + mean_tilt + 2.0 * mean_yaw_err
     
@@ -528,7 +539,7 @@ def main():
     print(f"Cost of Transport (CoT)       : {cost_of_transport:.2f}", flush=True)
     print(f"Total Mechanical Energy       : {total_energy:.2f} J", flush=True)
     print(f"Peak Impact Force             : {peak_impact_n:.1f} N", flush=True)
-    print(f"Mean Chassis Tilt             : {mean_tilt:.4f}", flush=True)
+    print(f"Mean Chassis Tilt             : {mean_tilt_deg:.2f}° (Max: {max_tilt_deg:.2f}° | Quad: {mean_tilt:.6f})", flush=True)
     print(f"Chassis Variability           : {chassis_variability:.5f} (Z_std: {sigma_height:.4f} m, Yaw_err: {mean_yaw_err:.5f})", flush=True)
     print(f"Mean Total Vertical Load (Fz) : {mean_sum_fz:.2f} N (Static W_sub: 20.54 N)", flush=True)
     print("=" * 85 + "\n", flush=True)

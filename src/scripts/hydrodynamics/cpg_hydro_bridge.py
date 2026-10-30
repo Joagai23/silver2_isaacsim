@@ -96,7 +96,7 @@ RENDER_INTERVAL = int(round((1.0 / RENDER_FPS) / SIM_DT))
 DECIMATION_RATIO = 4
 CPG_DT = SIM_DT * DECIMATION_RATIO
 TARGET_SPEED = 0.200
-STRIDE_FWD_CMD = 0.005
+STRIDE_FWD_CMD = 0.010
 STRIDE_LAT_CMD = 0.010
 WALKING_DIRECTION = SILVER2_DIRECTION_MAP["right"]
 
@@ -282,23 +282,40 @@ def main():
         leg_mounts=SILVER2_MOUNTS,
         link_lengths=SILVER2_LINKS,
         dt=CPG_DT,
-        total_period=1.200,
         gait="tripod",
         device=DEVICE
     )
 
-    # Optimized Gains for Crabbing (Left: Regular Optimization - Right: Low CoT Optimization)
-    cpg_controller.l2 = 0.002 # 0.00138
-    cpg_controller.k1 = 0.5547 # 0.4500
-    cpg_controller.k2 = 0.1111 # 0.1169
-    cpg_controller.k3 = 0.8039 # 0.7353
-    cpg_controller.epsilon = 0.4908 # 0.4632
-    cpg_controller.total_period = 1.171 # 1.345
-    cpg_controller.coupling_strength = 0.6599 # 0.4942
-    cpg_controller.b = 3.163 # 3.481
-    cpg_controller.f_touch = 5.01 # 2.80
-    cpg_controller.f_release = 0.22 # 1.40
-    
+    # Optimized Gains for Drag Crabbing
+    cpg_controller.update_parameters(
+        l2=0.00138,
+        k1=0.4500,
+        k2=0.1169,
+        k3=0.7353,
+        epsilon=0.4632,
+        total_period=1.345,
+        coupling_strength=0.4942,
+        b=3.481,
+        f_touch=2.80,
+        f_release=1.40
+    )
+
+    # Optimized 5cm Clearance Crabbing Champion
+    """
+    cpg_controller.update_parameters(
+        l2=0.00502,
+        k1=0.64525,
+        k2=0.02947,
+        k3=1.00000,
+        epsilon=0.51559,
+        total_period=1.99355,
+        coupling_strength=0.89948,
+        b=2.75621,
+        f_touch=4.64885,
+        f_release=1.33892
+    )
+    """
+
     # Dynamically-computed standing pose
     standing_targets_deg = np.array(SILVER2_STANDING_ANGLES_DEG, dtype=np.float32).flatten()
     standing_targets_rad = np.deg2rad(standing_targets_deg).astype(np.float32)
@@ -381,10 +398,11 @@ def main():
     peak_impact_n = 0.0
     total_energy = 0.0
     tilt_samples = []
+    tilt_deg_samples = []
     z_force_history = []
     z_samples = []
     yaw_samples = []
-
+    
     # Filter buffers (6 feet, 3 axes)
     accumulated_forces = torch.zeros((6, 3), device=DEVICE)
     filtered_forces = torch.zeros((6, 3), device=DEVICE)
@@ -417,18 +435,26 @@ def main():
             torch_targets = wp.to_torch(warp_targets).reshape(-1)
             newton_targets = torch_targets[canonical_to_newton].unsqueeze(0)
 
-            # Stability Telemetry
+            # Stability Telemetry (Relative to settled underwater stance: q_rel = q_settled^-1 * q_curr)
             curr_pos, curr_rot = robot_view.get_world_poses(clone=False)
-            tilt = float(2.0 * (curr_rot[0, 1]**2 + curr_rot[0, 2]**2))
-            tilt_samples.append(tilt)
-            z_samples.append(float(curr_pos[0, 2].item()))
+            w0, x0, y0, z0 = settled_rot[0, 0], settled_rot[0, 1], settled_rot[0, 2], settled_rot[0, 3]
+            w1, x1, y1, z1 = curr_rot[0, 0], curr_rot[0, 1], curr_rot[0, 2], curr_rot[0, 3]
 
-            q_rel_z = float(
-                settled_rot[0, 0] * curr_rot[0, 3]
-                - settled_rot[0, 1] * curr_rot[0, 2]
-                + settled_rot[0, 2] * curr_rot[0, 1]
-                - settled_rot[0, 3] * curr_rot[0, 0]
-            )
+            # Relative quaternion components (Hamilton product: q_0^* * q_1)
+            q_rel_x = float(w0 * x1 - x0 * w1 - y0 * z1 + z0 * y1)
+            q_rel_y = float(w0 * y1 + x0 * z1 - y0 * w1 - z0 * x1)
+            q_rel_z = float(w0 * z1 - x0 * y1 + y0 * x1 - z0 * w1)
+
+            # Quadratic tilt metric (1 - cos(theta_tilt)) for fitness parity
+            tilt_quad = 2.0 * (q_rel_x ** 2 + q_rel_y ** 2)
+            tilt_samples.append(tilt_quad)
+
+            # True physical tilt angle in radians and degrees for human-readable telemetry
+            sin_half_tilt = min(1.0, float(np.sqrt(q_rel_x ** 2 + q_rel_y ** 2)))
+            tilt_rad = 2.0 * float(np.arcsin(sin_half_tilt))
+            tilt_deg_samples.append(float(np.rad2deg(tilt_rad)))
+
+            z_samples.append(float(curr_pos[0, 2].item()))
             yaw_samples.append(2.0 * (q_rel_z ** 2))
 
         # B. Apply Hydrodynamic Forces
@@ -490,7 +516,11 @@ def main():
 
     sigma_height = float(np.std(z_samples)) if z_samples else 0.0
     mean_height_drift = abs(float(np.mean(z_samples)) - float(settled_pos[0, 2].item())) if z_samples else 0.0
+
     mean_tilt = float(np.mean(tilt_samples)) if tilt_samples else 0.0
+    mean_tilt_deg = float(np.mean(tilt_deg_samples)) if tilt_deg_samples else 0.0
+    max_tilt_deg = float(np.max(tilt_deg_samples)) if tilt_deg_samples else 0.0
+    
     mean_yaw_err = float(np.mean(yaw_samples)) if yaw_samples else 0.0
     chassis_variability = sigma_height + mean_height_drift + mean_tilt + 2.0 * mean_yaw_err
     
@@ -508,7 +538,7 @@ def main():
     print(f"Cost of Transport (CoT)       : {cost_of_transport:.2f}", flush=True)
     print(f"Total Mechanical Energy       : {total_energy:.2f} J", flush=True)
     print(f"Peak Impact Force             : {peak_impact_n:.1f} N", flush=True)
-    print(f"Mean Chassis Tilt             : {mean_tilt:.4f}", flush=True)
+    print(f"Mean Chassis Tilt             : {mean_tilt_deg:.2f}° (Max: {max_tilt_deg:.2f}° | Quad: {mean_tilt:.6f})", flush=True)
     print(f"Chassis Variability           : {chassis_variability:.5f} (Z_std: {sigma_height:.4f} m, Yaw_err: {mean_yaw_err:.5f})", flush=True)
     print(f"Mean Total Vertical Load (Fz) : {mean_sum_fz:.2f} N (Static W_sub: 20.54 N)", flush=True)
     print("=" * 85 + "\n", flush=True)

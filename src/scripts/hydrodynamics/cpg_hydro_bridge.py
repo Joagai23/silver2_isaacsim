@@ -287,6 +287,7 @@ def main():
     )
 
     # Optimized Gains for Drag Crabbing
+    """
     cpg_controller.update_parameters(
         l2=0.00138,
         k1=0.4500,
@@ -299,9 +300,9 @@ def main():
         f_touch=2.80,
         f_release=1.40
     )
+    """
 
     # Optimized 5cm Clearance Crabbing Champion
-    """
     cpg_controller.update_parameters(
         l2=0.00502,
         k1=0.64525,
@@ -314,7 +315,6 @@ def main():
         f_touch=4.64885,
         f_release=1.33892
     )
-    """
 
     # Dynamically-computed standing pose
     standing_targets_deg = np.array(SILVER2_STANDING_ANGLES_DEG, dtype=np.float32).flatten()

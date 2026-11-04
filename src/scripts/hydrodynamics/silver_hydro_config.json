@@ -11,7 +11,7 @@
             "liftCoefficient": 0.10,
             "linearAddedMassCoefficient": 0.25,
             "linearDamping": 3.0,
-            "linearDragCoefficient": 1.2,
+            "linearDragCoefficient": 1.26,
             "xDimension": 0.26,
             "yDimension": 0.26,
             "zDimension": 0.27
@@ -23,7 +23,7 @@
             "liftCoefficient": 0.05,
             "linearAddedMassCoefficient": 0.20,
             "linearDamping": 0.15,
-            "linearDragCoefficient": 0.8,
+            "linearDragCoefficient": 1.28,
             "xDimension": 0.06,
             "yDimension": 0.06,
             "zDimension": 0.09
@@ -35,7 +35,7 @@
             "liftCoefficient": 0.05,
             "linearAddedMassCoefficient": 0.20,
             "linearDamping": 0.15,
-            "linearDragCoefficient": 0.9,
+            "linearDragCoefficient": 1.12,
             "xDimension": 0.06,
             "yDimension": 0.09,
             "zDimension": 0.06
@@ -47,7 +47,7 @@
             "liftCoefficient": 0.05,
             "linearAddedMassCoefficient": 0.20,
             "linearDamping": 0.15,
-            "linearDragCoefficient": 1.0,
+            "linearDragCoefficient": 1.12,
             "xDimension": 0.06,
             "yDimension": 0.09,
             "zDimension": 0.06

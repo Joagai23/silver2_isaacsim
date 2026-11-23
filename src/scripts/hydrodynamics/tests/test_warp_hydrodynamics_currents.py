@@ -10,8 +10,8 @@ Tests the actual Warp CUDA kernel and CUDA Graph wrapper across:
   6. SILVER2 JSON config loading (`from_json`) across batched environments
 
 Run either directly or with pytest:
-    python test_warp_hydrodynamics_currents.py
-    pytest -v test_warp_hydrodynamics_currents.py
+    python src/scripts/hydrodynamics/tests/test_warp_hydrodynamics_currents.py
+    python -m pytest -v src/scripts/hydrodynamics/tests/test_warp_hydrodynamics_currents.py
 """
 
 import math

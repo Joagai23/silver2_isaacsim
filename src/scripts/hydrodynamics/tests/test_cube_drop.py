@@ -70,11 +70,11 @@ import sys
 from pathlib import Path
 
 # Resolve path to 'src/scripts'
-SCRIPTS_DIR = Path(__file__).resolve().parents[1]
+SCRIPTS_DIR = Path(__file__).resolve().parents[4]
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from warp_hydrodynamics_wrapper import WarpHydrodynamicsWrapper
+from src.scripts.hydrodynamics.warp_hydrodynamics_wrapper import WarpHydrodynamicsWrapper
 
 # Path Resolution & Simulation Parameters
 SCRIPT_DIR = Path(__file__).resolve()
@@ -90,7 +90,7 @@ RENDER_FPS = 60.0
 RENDER_INTERVAL = int(round((1.0 / RENDER_FPS) / SIM_DT))
 
 # Constant world-frame ocean current velocity (vx, vy, vz) in m/s
-OCEAN_CURRENT = (0.0, 0.0, 0.0)
+OCEAN_CURRENT = (0.3, 0.0, 0.0)
 
 TEST_DURATION_S = 15.0
 NUM_SIM_STEPS = int(round(TEST_DURATION_S / SIM_DT))

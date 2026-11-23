@@ -100,6 +100,16 @@ STRIDE_FWD_CMD = 0.010
 STRIDE_LAT_CMD = 0.010
 WALKING_DIRECTION = SILVER2_DIRECTION_MAP["right"]
 
+# Ocean Current Configuration
+# Leave as None to load globals.oceanCurrent from silver_hydro_config.json,
+# or set a 3-tuple (vx, vy, vz) in world frame [m/s] to override the JSON config.
+OCEAN_CURRENT_OVERRIDE = None
+# Settle in still water so settled_pos / settled_rot remain a clean level baseline
+# before applying ocean current during the active locomotion trial.
+SETTLE_IN_STILL_WATER = True
+# Optionally ramp ocean current from 0 to target over RAMP_STEPS when settling in still water.
+RAMP_OCEAN_CURRENT = False
+
 TEST_DURATION_S = 6.0
 NUM_SIM_STEPS = int(round(TEST_DURATION_S / SIM_DT))
 MAX_PHYS_ACCEL = 20.0
@@ -205,13 +215,19 @@ def main():
     )
     world.scene.add(robot_links_view)
 
-    # Instantiate Warp Hydrodynamics Wrapper from JSON
+    # Instantiate Warp Hydrodynamics Wrapper from JSON (reads globals.oceanCurrent by default)
     hydro_calculator = WarpHydrodynamicsWrapper.from_json(
         json_path=JSON_CONFIG_PATH,
         link_names_or_paths=link_paths,
-        device=DEVICE
+        device=DEVICE,
+        ocean_current=OCEAN_CURRENT_OVERRIDE,
     )
-    print(f"[INFO] HydrodynamicsBehavior (Warp GPU) initialized for {len(link_paths)} SILVER2 links.")
+    active_ocean_current = hydro_calculator.get_ocean_current()[0].clone()
+    curr_xyz = active_ocean_current.detach().cpu().tolist()
+    print(
+        f"[INFO] HydrodynamicsBehavior (Warp GPU) initialized for {len(link_paths)} SILVER2 links "
+        f"| Ocean Current: ({curr_xyz[0]:+.3f}, {curr_xyz[1]:+.3f}, {curr_xyz[2]:+.3f}) m/s"
+    )
 
     # Identify Tibia prim paths for contact reporting
     tibia_prim_paths = [f"{ROBOT_PRIM_PATH}/Tibia_{i}" for i in range(6)]
@@ -362,6 +378,7 @@ def main():
         max_force = link_masses * MAX_PHYS_ACCEL
         force_mag = torch.norm(dynamic_force, dim=-1, keepdim=True)
         scale = torch.clamp(max_force / (force_mag + 1e-6), max=1.0)
+        was_clipped = bool((scale < 1.0).any().item())
 
         net_force = t_buoyancy_force + (dynamic_force * scale)
         net_torque = t_torque_buoyancy + (dynamic_torque * scale)
@@ -371,13 +388,16 @@ def main():
             torques=net_torque.contiguous(),
             is_global=True
         )
-        return linear_velocity.clone(), angular_velocity.clone()
+        return linear_velocity.clone(), angular_velocity.clone(), was_clipped
 
     # Underwater Stance Settling Phase BEFORE capturing start_pos
+    if SETTLE_IN_STILL_WATER:
+        hydro_calculator.set_ocean_current((0.0, 0.0, 0.0))
+
     settling_steps = int(2 * SIM_HZ)
     print(f"[INFO] Settling robot underwater for {settling_steps} steps...")
     for settle_step in range(settling_steps):
-        last_linear_velocity, last_angular_velocity = apply_hydrodynamics_step(
+        last_linear_velocity, last_angular_velocity, _ = apply_hydrodynamics_step(
             last_linear_velocity, last_angular_velocity
         )
         robot_view.set_joint_position_targets(torch_standing_targets)
@@ -388,6 +408,10 @@ def main():
     settled_pos, settled_rot = robot_view.get_world_poses(clone=True)
     print(f"[INFO] Settling complete. Base Z: {settled_pos[0, 2]:.4f} m. State buffers established.")
 
+    # Restore configured ocean current for active locomotion trial
+    if SETTLE_IN_STILL_WATER and not RAMP_OCEAN_CURRENT:
+        hydro_calculator.set_ocean_current(active_ocean_current)
+
     # Compute empirical foot baseline directly from settled physics
     calibrated_feet_body = cpg_controller.compute_default_feet_body(SILVER2_STANDING_ANGLES_DEG)
 
@@ -397,6 +421,7 @@ def main():
     
     peak_impact_n = 0.0
     total_energy = 0.0
+    clipped_force_steps = 0
     tilt_samples = []
     tilt_deg_samples = []
     z_force_history = []
@@ -413,6 +438,9 @@ def main():
         # A. CPG Control Step (Decimated)
         if step % DECIMATION_RATIO == 0:
             ramp = min(1.0, (step + 1) / float(RAMP_STEPS))
+
+            if SETTLE_IN_STILL_WATER and RAMP_OCEAN_CURRENT:
+                hydro_calculator.set_ocean_current(active_ocean_current * ramp)
 
             # Exponential Moving Average (EMA) low-pass filter.
             if step > 0:
@@ -458,9 +486,11 @@ def main():
             yaw_samples.append(2.0 * (q_rel_z ** 2))
 
         # B. Apply Hydrodynamic Forces
-        last_linear_velocity, last_angular_velocity = apply_hydrodynamics_step(
+        last_linear_velocity, last_angular_velocity, was_clipped = apply_hydrodynamics_step(
             last_linear_velocity, last_angular_velocity
         )
+        if was_clipped:
+            clipped_force_steps += 1
 
         # C. Apply CPG Joint Targets
         robot_view.set_joint_position_targets(newton_targets)
@@ -523,12 +553,14 @@ def main():
     
     mean_yaw_err = float(np.mean(yaw_samples)) if yaw_samples else 0.0
     chassis_variability = sigma_height + mean_height_drift + mean_tilt + 2.0 * mean_yaw_err
+    current_speed = float(np.linalg.norm(curr_xyz))
     
     print("\n" + "=" * 85, flush=True)
     print("CPG GAIT BENCHMARK SUMMARY", flush=True)
     print("=" * 85, flush=True)
     print(f"Stride Command (Fwd / Lat)    : ({STRIDE_FWD_CMD * 100:.1f} cm, {STRIDE_LAT_CMD * 100:.1f} cm) | Dir={cmd_heading_deg:.1f}°", flush=True)
     print(f"Gait Parameters (T)           : Period={cpg_controller.total_period:.3f} s", flush=True)
+    print(f"Ocean Current (Vx, Vy, Vz)    : ({curr_xyz[0]:+.3f}, {curr_xyz[1]:+.3f}, {curr_xyz[2]:+.3f}) m/s (|v_c|={current_speed:.3f} m/s)", flush=True)
     print("-" * 85, flush=True)
     print(f"Total Planar Distance (XY)    : {total_planar_dist:.3f} m", flush=True)
     print(f"  --> Longitudinal Disp (X)   : {dx:.3f} m", flush=True)
@@ -541,6 +573,8 @@ def main():
     print(f"Mean Chassis Tilt             : {mean_tilt_deg:.2f}° (Max: {max_tilt_deg:.2f}° | Quad: {mean_tilt:.6f})", flush=True)
     print(f"Chassis Variability           : {chassis_variability:.5f} (Z_std: {sigma_height:.4f} m, Yaw_err: {mean_yaw_err:.5f})", flush=True)
     print(f"Mean Total Vertical Load (Fz) : {mean_sum_fz:.2f} N (Static W_sub: 20.54 N)", flush=True)
+    if clipped_force_steps > 0:
+        print(f"[WARN] Dynamic force clamp triggered on {clipped_force_steps}/{NUM_SIM_STEPS} steps (MAX_PHYS_ACCEL={MAX_PHYS_ACCEL:.1f} m/s²)", flush=True)
     print("=" * 85 + "\n", flush=True)
         
     world.stop()

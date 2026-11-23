@@ -89,6 +89,9 @@ SIM_DT = 1 / 420.0
 RENDER_FPS = 60.0
 RENDER_INTERVAL = int(round((1.0 / RENDER_FPS) / SIM_DT))
 
+# Constant world-frame ocean current velocity (vx, vy, vz) in m/s
+OCEAN_CURRENT = (0.0, 0.0, 0.0)
+
 TEST_DURATION_S = 15.0
 NUM_SIM_STEPS = int(round(TEST_DURATION_S / SIM_DT))
 MAX_PHYS_ACCEL = 20.0 
@@ -133,7 +136,7 @@ def main():
 
     # Create and set Prim before initializing the Physics
     rigid_prim = RigidPrim(
-            paths=str(CUBE_PRIM_PATH)
+        paths=str(CUBE_PRIM_PATH)
     )
     
     rigid_prim.set_masses(wp.array([1000.0], dtype=wp.float32, device=DEVICE))
@@ -162,16 +165,17 @@ def main():
         width=1.00, 
         depth=1.00, 
         height=1.00,
-        linear_drag_coefficient=1.2,
-        angular_drag_coefficient=0.8,
-        linear_damping=300.00,
-        angular_damping=150.00,
+        linear_drag_coefficient=1.26,
+        angular_drag_coefficient=0.10,
+        linear_damping=3.00,
+        angular_damping=0.25,
         water_density=1025.00, 
         gravity=9.81,
-        linear_mass_coeff = 0.2,
-        angular_mass_coeff = 0.1,
-        lift_coefficient=0.5,
-        device=DEVICE
+        linear_mass_coeff=0.25,
+        angular_mass_coeff=0.10,
+        lift_coefficient=0.10,
+        device=DEVICE,
+        ocean_current=OCEAN_CURRENT,
     )
 
     # Fetch mass to avoid explosions
@@ -180,7 +184,10 @@ def main():
     last_linear_velocity = None
     last_angular_velocity = None
 
-    print(f"HydrodynamicsBehavior (Warp GPU) initialized for {CUBE_PRIM_PATH} with mass {mass} kg")
+    print(
+        f"HydrodynamicsBehavior (Warp GPU) initialized for {CUBE_PRIM_PATH} with mass {mass} kg "
+        f"| Ocean Current: ({OCEAN_CURRENT[0]:+.3f}, {OCEAN_CURRENT[1]:+.3f}, {OCEAN_CURRENT[2]:+.3f}) m/s"
+    )
 
     for step in range(NUM_SIM_STEPS):
         positions, orientations = rigid_prim.get_world_poses()
@@ -233,22 +240,18 @@ def main():
         t_torque_drag = torch.cross(t_center_of_pressure - positions, t_drag_force, dim=-1)
         t_torque_lift = torch.cross(t_center_of_pressure - positions, t_lift_force, dim=-1)
 
-        # Calculate final net force and torque
-        net_force = t_buoyancy_force + t_drag_force + t_lift_force + t_added_mass_force
-        net_torque = (
-            t_torque_buoyancy
-            + t_torque_drag
-            + t_torque_lift
-            + t_drag_torque
-            + t_added_mass_torque
-        )
-        
+        # Separate static buoyancy from dynamic hydrodynamic forces before clamping
+        # so high horizontal current drag never artificially attenuates buoyancy.
+        dynamic_force = t_drag_force + t_lift_force + t_added_mass_force
+        dynamic_torque = t_torque_drag + t_torque_lift + t_drag_torque + t_added_mass_torque
+
         # Safety Clamp (Prevent Explosions)
         max_force = mass * MAX_PHYS_ACCEL
-        force_mag = torch.norm(net_force, dim=-1, keepdim=True)
+        force_mag = torch.norm(dynamic_force, dim=-1, keepdim=True)
         scale = torch.clamp(max_force / (force_mag + 1e-6), max=1.0)
-        net_force = net_force * scale
-        net_torque = net_torque * scale
+
+        net_force = t_buoyancy_force + (dynamic_force * scale)
+        net_torque = t_torque_buoyancy + (dynamic_torque * scale)
         
         # Apply to Simulation
         rigid_prim.apply_forces_and_torques_at_pos(
@@ -262,12 +265,11 @@ def main():
 
         if step % 30 == 0:
             print(
-                f"[Step {step:04d}] Z_pos: {positions[0, 2].item():+.3f}m | "
-                f"Z_vel: {linear_velocity[0, 2].item():+.3f}m/s | "
-                f"Z_acc: {linear_acceleration[0, 2].item():+.1f}m/s² | "
-                f"F_buoy: {t_buoyancy_force[0, 2].item():+.1f}N | "
-                f"F_drag: {t_drag_force[0, 2].item():+.1f}N | "
-                f"F_net: {net_force[0, 2].item():+.1f}N",
+                f"[Step {step:04d}] Pos: ({positions[0, 0].item():+.3f}, {positions[0, 1].item():+.3f}, {positions[0, 2].item():+.3f})m | "
+                f"Vel: ({linear_velocity[0, 0].item():+.3f}, {linear_velocity[0, 1].item():+.3f}, {linear_velocity[0, 2].item():+.3f})m/s | "
+                f"F_buoy_z: {t_buoyancy_force[0, 2].item():+.1f}N | "
+                f"F_drag: ({t_drag_force[0, 0].item():+.1f}, {t_drag_force[0, 2].item():+.1f})N | "
+                f"F_net: ({net_force[0, 0].item():+.1f}, {net_force[0, 2].item():+.1f})N",
                 flush=True,
             )
         

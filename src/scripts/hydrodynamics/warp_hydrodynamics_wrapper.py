@@ -1,8 +1,10 @@
 import json
 from pathlib import Path
-from typing import Sequence, Union
+from typing import Optional, Sequence, Union
+import torch
 import warp as wp
 from src.scripts.hydrodynamics.warp_hydrodynamics import solve_hydrodynamics_kernel
+
 
 class WarpHydrodynamicsWrapper:
     """
@@ -25,8 +27,8 @@ class WarpHydrodynamicsWrapper:
         gravity: float = 9.81,
         num_envs: int = 1,
         device: str = "cuda:0",
+        ocean_current: Union[Sequence[float], torch.Tensor] = (0.0, 0.0, 0.0),
     ):
-        
         self.device = device
         self.num_envs = num_envs
         self.graph = None
@@ -79,6 +81,14 @@ class WarpHydrodynamicsWrapper:
         self.in_ang_vel = wp.zeros(self.total_bodies, dtype=wp.vec3, device=device)
         self.in_lin_acc = wp.zeros(self.total_bodies, dtype=wp.vec3, device=device)
         self.in_ang_acc = wp.zeros(self.total_bodies, dtype=wp.vec3, device=device)
+        self.in_current_vel = wp.zeros(self.total_bodies, dtype=wp.vec3, device=device)
+
+        # Zero-copy PyTorch views of the fixed current buffer for fast in-place updates
+        self.t_in_current_vel = wp.to_torch(self.in_current_vel)
+        self._t_in_current_vel_env = self.t_in_current_vel.view(self.num_envs, self.num_links, 3)
+
+        # Initialize ocean current buffer (constant across all envs by default)
+        self.set_ocean_current(ocean_current)
 
         # Shared local face normals for any axis-aligned local box
         local_face_normals = [
@@ -87,8 +97,8 @@ class WarpHydrodynamicsWrapper:
             [0.0, 0.0, 1.0], [0.0, 0.0, -1.0],
         ]
         self.wp_normals = wp.array(local_face_normals, dtype=wp.vec3, device=device)
-        
-        # Build per-link geometry & physics tables
+
+        # Build per-link geometry & physics tables (environment-major order)
         all_keypoints = []
         all_areas = []
         all_centers = []
@@ -151,7 +161,7 @@ class WarpHydrodynamicsWrapper:
                 ang_am_vec = [ang_am_x, ang_am_y, ang_am_z]
 
                 all_added_mass.append([lin_am_vec, ang_am_vec])
-        
+
         # Allocate 2D Per-Link GPU Arrays
         self.wp_keypoints = wp.array(all_keypoints, dtype=wp.vec3, device=device)
         self.wp_areas = wp.array(all_areas, dtype=wp.float32, device=device)
@@ -179,6 +189,101 @@ class WarpHydrodynamicsWrapper:
         self.t_out_center_of_buoyancy = wp.to_torch(self.out_center_of_buoyancy)
         self.t_out_center_of_pressure = wp.to_torch(self.out_center_of_pressure)
 
+    def set_ocean_current(
+        self,
+        current_velocity: Union[Sequence[float], torch.Tensor],
+        env_ids: Optional[Union[int, Sequence[int], torch.Tensor]] = None,
+    ) -> None:
+        """
+        Updates the fixed-address ocean current buffer in place (CUDA Graph safe).
+
+        Accepted shapes for `current_velocity`:
+            - When `env_ids is None`:
+                - (3,) or (1, 3): constant current broadcast to all environments and links.
+                - (num_envs, 3): per-environment current broadcast to all links in each env.
+                - (total_bodies, 3) or (num_envs, num_links, 3): per-link current.
+            - When `env_ids` is provided (length K):
+                - (3,) or (1, 3): constant current applied to the specified environments.
+                - (K, 3): per-environment current for the specified environments.
+                - (K, num_links, 3): per-link current for the specified environments.
+        """
+        with torch.no_grad():
+            t_curr = torch.as_tensor(current_velocity, dtype=torch.float32, device=self.device)
+
+            if env_ids is None:
+                if t_curr.ndim == 1 and t_curr.shape == (3,):
+                    self._t_in_current_vel_env.copy_(t_curr.view(1, 1, 3))
+                elif t_curr.ndim == 2 and t_curr.shape == (1, 3):
+                    self._t_in_current_vel_env.copy_(t_curr.view(1, 1, 3))
+                elif t_curr.ndim == 2 and t_curr.shape == (self.num_envs, 3):
+                    self._t_in_current_vel_env.copy_(t_curr.unsqueeze(1))
+                elif t_curr.ndim == 2 and t_curr.shape == (self.total_bodies, 3):
+                    self.t_in_current_vel.copy_(t_curr)
+                elif t_curr.ndim == 3 and t_curr.shape == (self.num_envs, self.num_links, 3):
+                    self._t_in_current_vel_env.copy_(t_curr)
+                else:
+                    raise ValueError(
+                        f"Unsupported ocean current shape {tuple(t_curr.shape)}. Expected (3,), "
+                        f"(1, 3), ({self.num_envs}, 3), ({self.total_bodies}, 3), or "
+                        f"({self.num_envs}, {self.num_links}, 3)."
+                    )
+            else:
+                t_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device).reshape(-1)
+                if t_ids.numel() == 0:
+                    return
+                n_ids = t_ids.numel()
+
+                if t_curr.ndim == 1 and t_curr.shape == (3,):
+                    self._t_in_current_vel_env[t_ids] = t_curr.view(1, 1, 3)
+                elif t_curr.ndim == 2 and t_curr.shape == (1, 3):
+                    self._t_in_current_vel_env[t_ids] = t_curr.view(1, 1, 3)
+                elif t_curr.ndim == 2 and t_curr.shape == (n_ids, 3):
+                    self._t_in_current_vel_env[t_ids] = t_curr.unsqueeze(1)
+                elif t_curr.ndim == 3 and t_curr.shape == (n_ids, self.num_links, 3):
+                    self._t_in_current_vel_env[t_ids] = t_curr
+                else:
+                    raise ValueError(
+                        f"Unsupported ocean current shape {tuple(t_curr.shape)} for {n_ids} env_ids. "
+                        f"Expected (3,), (1, 3), ({n_ids}, 3), or ({n_ids}, {self.num_links}, 3)."
+                    )
+
+    def randomize_ocean_current(
+        self,
+        min_velocity: Union[Sequence[float], torch.Tensor],
+        max_velocity: Union[Sequence[float], torch.Tensor],
+        env_ids: Optional[Union[int, Sequence[int], torch.Tensor]] = None,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """
+        Samples uniform random 3D ocean current vectors per environment in
+        [min_velocity, max_velocity] and writes them in place to the GPU buffer.
+        Returns the sampled per-environment current tensor of shape (N, 3).
+        """
+        with torch.no_grad():
+            t_min = torch.as_tensor(min_velocity, dtype=torch.float32, device=self.device).view(1, 3)
+            t_max = torch.as_tensor(max_velocity, dtype=torch.float32, device=self.device).view(1, 3)
+
+            if env_ids is None:
+                n_samples = self.num_envs
+                t_ids = None
+            else:
+                t_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device).reshape(-1)
+                n_samples = t_ids.numel()
+                if n_samples == 0:
+                    return torch.empty((0, 3), dtype=torch.float32, device=self.device)
+
+            u = torch.rand((n_samples, 3), dtype=torch.float32, device=self.device, generator=generator)
+            sampled = t_min + u * (t_max - t_min)
+            self.set_ocean_current(sampled, env_ids=t_ids)
+            return sampled
+
+    def get_ocean_current(self) -> torch.Tensor:
+        """
+        Returns a zero-copy view of the per-environment ocean current velocities
+        with shape (num_envs, 3).
+        """
+        return self._t_in_current_vel_env[:, 0, :]
+
     @classmethod
     def from_json(
         cls,
@@ -186,10 +291,11 @@ class WarpHydrodynamicsWrapper:
         link_names_or_paths: Sequence[str],
         num_envs: int = 1,
         device: str = "cuda:0",
+        ocean_current: Optional[Union[Sequence[float], torch.Tensor]] = None,
     ) -> "WarpHydrodynamicsWrapper":
         """
         Builds a multi-link WarpHydrodynamicsWrapper directly from the SILVER2 JSON configuration
-        and a list of link names or USD prim paths (e.g., from `rigid_prim.paths`).
+        and a list of link names or USD prim paths.
         """
         with open(json_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
@@ -197,6 +303,8 @@ class WarpHydrodynamicsWrapper:
         globals_cfg = cfg.get("globals", {})
         water_density = float(globals_cfg.get("waterDensity", 1025.0))
         gravity = float(globals_cfg.get("gravity", 9.81))
+        if ocean_current is None:
+            ocean_current = globals_cfg.get("oceanCurrent", [0.0, 0.0, 0.0])
         parts_cfg = cfg["parts"]
 
         widths, depths, heights = [], [], []
@@ -244,6 +352,7 @@ class WarpHydrodynamicsWrapper:
             gravity=gravity,
             num_envs=num_envs,
             device=device,
+            ocean_current=ocean_current,
         )
 
     def calculate_hydrodynamic_forces(
@@ -254,10 +363,14 @@ class WarpHydrodynamicsWrapper:
         t_angular_velocity,
         t_linear_acceleration,
         t_angular_acceleration,
+        t_current_velocity: Optional[Union[Sequence[float], torch.Tensor]] = None,
     ):
         """
         Copies PyTorch input tensors of shape (total_bodies, 3) / (total_bodies, 4) into
         fixed CUDA Graph buffers, replays the graph, and returns zero-copy PyTorch tensor views.
+
+        If `t_current_velocity` is None, reuses the existing ocean current buffer set via
+        `__init__`, `set_ocean_current`, or `randomize_ocean_current` (zero copy overhead).
         """
         self.in_position.assign(wp.from_torch(t_position, dtype=wp.vec3))
         self.in_orientation.assign(wp.from_torch(t_orientation, dtype=wp.quat))
@@ -265,6 +378,9 @@ class WarpHydrodynamicsWrapper:
         self.in_ang_vel.assign(wp.from_torch(t_angular_velocity, dtype=wp.vec3))
         self.in_lin_acc.assign(wp.from_torch(t_linear_acceleration, dtype=wp.vec3))
         self.in_ang_acc.assign(wp.from_torch(t_angular_acceleration, dtype=wp.vec3))
+
+        if t_current_velocity is not None:
+            self.set_ocean_current(t_current_velocity)
 
         # Use CUDA graphs
         if self.graph is None:
@@ -279,6 +395,7 @@ class WarpHydrodynamicsWrapper:
                     self.in_ang_vel,
                     self.in_lin_acc,
                     self.in_ang_acc,
+                    self.in_current_vel,
                     self.wp_keypoints,
                     self.wp_normals,
                     self.wp_centers,
@@ -301,7 +418,7 @@ class WarpHydrodynamicsWrapper:
             self.graph = wp.capture_end(device=self.device)
 
         wp.capture_launch(self.graph)
-        
+
         return (
             self.t_out_buoyancy_force,
             self.t_out_drag_force,

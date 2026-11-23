@@ -1,7 +1,8 @@
 {
     "globals": {
         "waterDensity": 1025.0,
-        "gravity": 9.81
+        "gravity": 9.81,
+        "oceanCurrent": [0.0, 0.0, 0.0]
     },
     "parts": {
         "body": {
